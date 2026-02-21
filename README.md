@@ -1,149 +1,97 @@
-# 🎬 Netflix Content Analysis — SQL Project
+# 🎬 Netflix Data Analysis Using SQL
 
-> **End-to-end SQL analysis of Netflix's global catalog exploring content trends, country distribution, genre popularity, ratings, and business strategy insights.**
-
----
-
-## 📌 Project Overview
-
-This project demonstrates applied SQL skills by analysing a real-world Netflix dataset. Using **SQLite**, I performed 30+ queries across eight analysis areas to extract actionable business insights about Netflix's content strategy.
-
-**Dataset:** [Netflix Movies and TV Shows (Till 2025)](https://www.kaggle.com/datasets/bhargavchirumamilla/netflix-movies-and-tv-shows-till-2025) — Kaggle  
-**Tool:** SQLite (compatible with PostgreSQL / MySQL with minor syntax adjustments)
+> SQL-based analysis of Netflix's global content catalog — uncovering trends in content type, country, genre, ratings, and more.
 
 ---
 
-## 🛠️ Tech Stack
+## 📌 Overview
 
-| Tool | Purpose |
-|------|---------|
-| **SQLite** | Database engine |
-| **SQL** | Data querying & analysis |
-| **Python** | Database setup / CSV loading |
-| **DB Browser for SQLite** | GUI for running & exploring queries |
+This project answers **15 business-relevant questions** about Netflix's content library using SQL. It demonstrates data cleaning, aggregation, window functions, and string parsing on a real-world dataset.
+
+**Dataset:** [Netflix Movies and TV Shows (Till 2025) — Kaggle](https://www.kaggle.com/datasets/bhargavchirumamilla/netflix-movies-and-tv-shows-till-2025)  
+**Reference:** [Kaggle Notebook by ankush0511](https://www.kaggle.com/code/ankush0511/netflix-data-analysis)  
+**Tools:** SQLite / PostgreSQL · SQL · Python (setup script)
 
 ---
 
-## 📂 Project Structure
+## 📁 Project Files
 
-```
-netflix-sql-project/
-│
-├── netflix_analysis.sql   ← All SQL queries (30+)
-├── setup_database.py      ← Loads Kaggle CSV → SQLite DB
-├── README.md
-└── netflix.db             ← Generated after running setup (not committed)
-```
+| File | Description |
+|------|-------------|
+| `netflix_analysis.sql` | All 15 business questions + 5 bonus queries |
+| `setup_database.py` | Loads the Kaggle CSV into a local SQLite `.db` file |
+| `netflix_titles.csv` | Download from Kaggle (not included in repo) |
 
 ---
 
 ## 🚀 Getting Started
 
-### 1. Clone the repo
-```bash
-git clone https://github.com/YOUR_USERNAME/netflix-sql-project.git
-cd netflix-sql-project
-```
-
-### 2. Download the dataset
-- Go to the [Kaggle dataset page](https://www.kaggle.com/datasets/bhargavchirumamilla/netflix-movies-and-tv-shows-till-2025)
-- Download `netflix_titles.csv` and place it in the project root
-
-### 3. Create the database
-```bash
-python setup_database.py
-```
-This creates `netflix.db` with all titles loaded.
-
-### 4. Run the queries
-Open `netflix_analysis.sql` in:
-- **DB Browser for SQLite** (recommended, free GUI)
-- Or any SQLite-compatible client
+1. Download `netflix_titles.csv` from the [Kaggle dataset page](https://www.kaggle.com/datasets/bhargavchirumamilla/netflix-movies-and-tv-shows-till-2025)
+2. Place it in this project folder
+3. Run the setup script:
+   ```bash
+   python setup_database.py
+   ```
+4. Open `netflix_analysis.sql` in [DB Browser for SQLite](https://sqlitebrowser.org/) and run any query
 
 ---
 
-## 📊 Analysis Sections
+## 📊 Business Questions Answered
 
-### 1️⃣ Basic Exploration
-- Total catalog size
-- Movies vs. TV Shows split with percentages
-- Most recently added titles
+| # | Question |
+|---|----------|
+| Q1 | Count Movies vs TV Shows |
+| Q2 | Most common rating for Movies and TV Shows |
+| Q3 | All movies released in 2020 |
+| Q4 | Top 5 countries with the most Netflix content |
+| Q5 | Identify the longest movie on Netflix |
+| Q6 | Content added in the last 5 years |
+| Q7 | All titles directed by 'Rajiv Chilaka' |
+| Q8 | TV Shows with more than 5 seasons |
+| Q9 | Content count in each genre |
+| Q10 | Average content releases per year in India (top 5 years) |
+| Q11 | All documentary movies |
+| Q12 | Content with no director listed |
+| Q13 | Movies featuring 'Salman Khan' in the last 10 years |
+| Q14 | Top 10 actors in Indian Netflix movies |
+| Q15 | Classify content as 'Good' or 'Bad' based on description keywords |
 
-### 2️⃣ Content by Country
-- Top 10 content-producing countries
-- US vs. International content ratio
-- Content type breakdown per country
-
-### 3️⃣ Genre Analysis
-- Top 10 genres across the entire catalog
-- Genre popularity: Movies vs. TV Shows compared
-- Most common genre combinations
-
-### 4️⃣ Ratings & Audience Targeting
-- Full rating distribution (TV-MA, R, PG-13, etc.)
-- Mature vs. Teen vs. Family content breakdown
-- Rating patterns by content type
-
-### 5️⃣ Release Year Trends
-- Titles released per year since 2010
-- Year-over-year growth in Netflix additions
-- Average catalog age by content type
-
-### 6️⃣ Directors & Cast Insights
-- Most prolific directors on Netflix
-- Directors who created both Movies and TV Shows
-- Top 15 actors by appearance count
-
-### 7️⃣ Duration Analysis
-- Average, min, and max movie runtimes
-- Movie runtime distribution (bucketed)
-- TV show season-count distribution
-
-### 8️⃣ Business Insights
-- Most content-rich year per country
-- Catalog age segmentation (new vs. classic)
-- Top genre per country — content strategy insight
-- Correlation: Do mature shows run longer?
+**Bonus Queries:** Year-wise additions · Top directors · Runtime distribution · US vs International · Peak upload month
 
 ---
 
 ## 💡 Key Findings
 
 | Insight | Finding |
-|--------|---------|
-| **Content split** | Netflix catalog is roughly 50/50 Movies vs. TV Shows |
-| **Top country** | The United States dominates, but international content is ~40%+ |
-| **Top genre** | Drama is the most prevalent genre across both Movies and TV Shows |
-| **Mature content** | TV-MA and R-rated content accounts for the majority of the catalog |
-| **Content freshness** | Most titles were released within the last 5 years |
-| **International leaders** | South Korea, Spain, India, and Japan are top international producers |
+|---------|---------|
+| Content split | Netflix has more Movies than TV Shows |
+| Most common rating | TV-MA dominates both Movies and TV Shows |
+| Top country | United States leads, followed by India and United Kingdom |
+| Top genres | Dramas, Comedies, and Documentaries appear most frequently |
+| Content without directors | A notable portion — mostly stand-up specials and reality formats |
+| India trend | 2018–2020 saw the highest average content additions from India |
+| 'Bad' content | A small percentage of titles contain keywords like 'kill' or 'violence' |
 
 ---
 
-## 🎯 SQL Concepts Demonstrated
+## 🧠 SQL Concepts Demonstrated
 
 - `GROUP BY`, `ORDER BY`, `HAVING`
-- Aggregate functions: `COUNT`, `AVG`, `MIN`, `MAX`, `SUM`
 - Window functions: `RANK() OVER (PARTITION BY ...)`
-- Conditional aggregation with `CASE WHEN`
+- Aggregate functions: `COUNT`, `AVG`, `ROUND`, `MAX`
+- Conditional logic: `CASE WHEN`
 - Subqueries and derived tables
-- `json_each()` for parsing comma-separated values
-- String manipulation: `REPLACE`, `TRIM`, `SUBSTR`, `CAST`
-- Self-joins and CTEs (Common Table Expressions)
+- String functions: `LIKE`, `TRIM`, `REPLACE`, `SUBSTR`, `INSTR`
+- JSON parsing for multi-value columns: `json_each()` (SQLite) / `UNNEST + STRING_TO_ARRAY` (PostgreSQL)
 
 ---
 
-## 📈 Potential Extensions
+## 📄 Resume Entry
 
-- Connect to **Tableau / Power BI** for visual dashboards
-- Use **Python (pandas + matplotlib)** to visualise query results
-- Migrate to **PostgreSQL** for production-scale practice
-- Add a **year-over-year trend** analysis using LAG() window functions
+> **Netflix Data Analysis Using SQL** — Performed 20+ SQL queries on a Netflix dataset (8,000+ titles) to answer business questions around content trends, country distribution, genre popularity, and audience targeting. Used window functions, conditional aggregation, and string parsing. Tools: SQLite, Python.
 
 ---
 
-## 🙋 About
+## About
 
-Built as a portfolio project to demonstrate SQL proficiency, analytical thinking, and the ability to derive business insights from real-world data.
-
-**Connect:** [LinkedIn](https://linkedin.com) | [GitHub](https://github.com)
+Built as a portfolio project to demonstrate SQL proficiency and the ability to extract actionable business insights from real-world data.
