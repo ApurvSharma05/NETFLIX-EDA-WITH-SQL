@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  netflix-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: netflix-catalog-api
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - NETFLIX_DB_PATH=netflix.db
+    volumes:
+      - ./netflix.db:/app/netflix.db
+    restart: unless-stopped

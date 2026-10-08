@@ -7,15 +7,15 @@
 
 
 -- ============================================================
--- TABLE SCHEMA
+-- TABLE SCHEMA & COMPATIBILITY VIEW
 -- ============================================================
 
-CREATE TABLE netflix (
-    show_id      VARCHAR(10),
+CREATE TABLE IF NOT EXISTS netflix_titles (
+    show_id      VARCHAR(10) PRIMARY KEY,
     type         VARCHAR(10),
     title        VARCHAR(250),
     director     VARCHAR(550),
-    casts        VARCHAR(1050),
+    cast         VARCHAR(1050),
     country      VARCHAR(550),
     date_added   VARCHAR(55),
     release_year INT,
@@ -24,6 +24,23 @@ CREATE TABLE netflix (
     listed_in    VARCHAR(250),
     description  VARCHAR(550)
 );
+
+-- Compatibility view ensuring queries referencing `netflix` and `casts` execute seamlessly
+CREATE VIEW IF NOT EXISTS netflix AS
+SELECT
+    show_id,
+    type,
+    title,
+    director,
+    [cast] AS casts,
+    country,
+    date_added,
+    release_year,
+    rating,
+    duration,
+    listed_in,
+    description
+FROM netflix_titles;
 
 
 -- ============================================================
@@ -82,13 +99,13 @@ WHERE type = 'Movie'
 -- ============================================================
 
 -- PostgreSQL version (handles multi-country entries):
-SELECT
-    TRIM(UNNEST(STRING_TO_ARRAY(country, ','))) AS new_country,
-    COUNT(show_id)                               AS total_content
-FROM netflix
-GROUP BY new_country
-ORDER BY total_content DESC
-LIMIT 5;
+-- SELECT
+--     TRIM(UNNEST(STRING_TO_ARRAY(country, ','))) AS new_country,
+--     COUNT(show_id)                               AS total_content
+-- FROM netflix
+-- GROUP BY new_country
+-- ORDER BY total_content DESC
+-- LIMIT 5;
 
 -- SQLite-compatible version:
 SELECT
@@ -120,11 +137,15 @@ LIMIT 1;
 -- Q6. Find content added in the last 5 years
 -- ============================================================
 
--- SQLite-compatible:
+-- SQLite-compatible (handles both ISO YYYY-MM-DD and 'Month DD, YYYY' formats):
 SELECT *
 FROM netflix
-WHERE CAST(SUBSTR(TRIM(date_added), -4) AS INTEGER)
-      >= (CAST(STRFTIME('%Y', 'now') AS INTEGER) - 5);
+WHERE (
+    CASE
+        WHEN date_added LIKE '____-__-__%' THEN CAST(SUBSTR(TRIM(date_added), 1, 4) AS INTEGER)
+        ELSE CAST(SUBSTR(TRIM(date_added), -4) AS INTEGER)
+    END
+) >= (CAST(STRFTIME('%Y', 'now') AS INTEGER) - 5);
 
 -- PostgreSQL:
 -- SELECT * FROM netflix
@@ -163,7 +184,7 @@ SELECT
     COUNT(show_id) AS total_content
 FROM netflix,
      json_each('["' || REPLACE(listed_in, ', ', '","') || '"]')
-WHERE listed_in IS NOT NULL
+WHERE listed_in IS NOT NULL AND listed_in != ''
 GROUP BY genre
 ORDER BY total_content DESC;
 
@@ -174,7 +195,7 @@ ORDER BY total_content DESC;
 
 
 -- ============================================================
--- Q10. Find each year and the average number of content releases
+-- Q10. Find each year and the percentage of content releases
 --      IN INDIA on Netflix — return top 5 years
 -- ============================================================
 
@@ -184,11 +205,11 @@ SELECT
     COUNT(show_id) AS total_release,
     ROUND(
         COUNT(show_id) * 1.0 /
-        (SELECT COUNT(show_id) FROM netflix WHERE country = 'India') * 100,
+        (SELECT COUNT(show_id) FROM netflix WHERE country = 'India' OR country LIKE '%India%') * 100,
         2
     ) AS avg_release_pct
 FROM netflix
-WHERE country = 'India'
+WHERE country = 'India' OR country LIKE '%India%'
 GROUP BY country, release_year
 ORDER BY avg_release_pct DESC
 LIMIT 5;
@@ -235,7 +256,7 @@ SELECT
     COUNT(*)     AS appearances
 FROM netflix,
      json_each('["' || REPLACE(casts, ', ', '","') || '"]')
-WHERE country LIKE '%India%'
+WHERE (country = 'India' OR country LIKE '%India%')
   AND casts IS NOT NULL AND casts != ''
 GROUP BY actor
 ORDER BY appearances DESC
@@ -283,7 +304,10 @@ ORDER BY content_label;
 
 -- B1. Year-wise content additions to Netflix
 SELECT
-    SUBSTR(TRIM(date_added), -4) AS year_added,
+    CASE
+        WHEN date_added LIKE '____-__-__%' THEN SUBSTR(TRIM(date_added), 1, 4)
+        ELSE SUBSTR(TRIM(date_added), -4)
+    END                          AS year_added,
     COUNT(*)                     AS titles_added
 FROM netflix
 WHERE date_added IS NOT NULL AND date_added != ''
@@ -320,11 +344,11 @@ GROUP BY runtime_bucket;
 -- B4. US vs International content ratio
 SELECT
     CASE
-        WHEN country = 'United States' THEN 'US Content'
+        WHEN country LIKE '%United States%' THEN 'US Content'
         ELSE 'International'
     END           AS origin,
     COUNT(*)      AS total,
-    ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM netflix WHERE country IS NOT NULL), 1) AS pct
+    ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM netflix WHERE country IS NOT NULL AND country != ''), 1) AS pct
 FROM netflix
 WHERE country IS NOT NULL AND country != ''
 GROUP BY origin;
@@ -332,7 +356,19 @@ GROUP BY origin;
 
 -- B5. Which month does Netflix add the most content?
 SELECT
-    TRIM(SUBSTR(date_added, 1, INSTR(date_added, ' ') - 1)) AS month,
+    CASE
+        WHEN date_added LIKE '____-__-__%' THEN
+            CASE SUBSTR(date_added, 6, 2)
+                WHEN '01' THEN 'January'   WHEN '02' THEN 'February'
+                WHEN '03' THEN 'March'     WHEN '04' THEN 'April'
+                WHEN '05' THEN 'May'       WHEN '06' THEN 'June'
+                WHEN '07' THEN 'July'      WHEN '08' THEN 'August'
+                WHEN '09' THEN 'September' WHEN '10' THEN 'October'
+                WHEN '11' THEN 'November'  WHEN '12' THEN 'December'
+                ELSE 'Unknown'
+            END
+        ELSE TRIM(SUBSTR(date_added, 1, INSTR(date_added, ' ') - 1))
+    END      AS month,
     COUNT(*) AS titles_added
 FROM netflix
 WHERE date_added IS NOT NULL AND date_added != ''
