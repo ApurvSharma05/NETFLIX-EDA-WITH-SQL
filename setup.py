@@ -4,7 +4,9 @@ setup.py
 Automated data pipeline and database initialization for Netflix Catalog Analytics.
 
 Capabilities:
-1. Downloads dataset via kagglehub (or gracefully falls back to local CSV if present).
+1. Picks the dataset: --sample / $NETFLIX_CSV override, else a local full CSV, else the Kaggle
+   download (kagglehub); the bundled 20-row sample is used only if the download is unavailable.
+   The sample is always written to netflix_sample.db, never into netflix.db.
 2. Cleans and standardizes catalog metadata (dates, countries, text trimming).
 3. Ingests records into a normalized SQLite database (netflix.db).
 4. Creates high-performance B-Tree indexes for fast analytical query execution.
@@ -14,6 +16,7 @@ Capabilities:
 import os
 import sys
 import csv
+import argparse
 import sqlite3
 import logging
 from datetime import datetime
@@ -28,47 +31,74 @@ logging.basicConfig(
 logger = logging.getLogger("netflix_etl")
 
 DB_FILE = "netflix.db"
+SAMPLE_DB_FILE = "netflix_sample.db"
 DATASET_ID = "bhargavchirumamilla/netflix-movies-and-tv-shows-till-2025"
-CANDIDATE_CSV_NAMES = [
+FULL_CSV_NAMES = [
     "netflix_movies_detailed_up_to_2025.csv",
     "netflix_titles.csv",
-    "sample_netflix.csv"
 ]
+SAMPLE_CSV_NAME = "sample_netflix.csv"
+SAMPLE_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), SAMPLE_CSV_NAME)
+CSV_ENV_VAR = "NETFLIX_CSV"
 
 
-def resolve_csv_source() -> str:
-    """Finds a local CSV or downloads the dataset via kagglehub."""
-    # Check if a candidate CSV already exists in the workspace
-    for fname in CANDIDATE_CSV_NAMES:
+def _find_csv(directory: str) -> str:
+    """Returns a known catalog CSV inside `directory`, else any CSV found under it."""
+    for fname in FULL_CSV_NAMES:
+        candidate = os.path.join(directory, fname)
+        if os.path.exists(candidate):
+            return candidate
+    for root, _, files in os.walk(directory):
+        for f in files:
+            if f.endswith(".csv"):
+                return os.path.join(root, f)
+    raise FileNotFoundError(f"No CSV file found in '{directory}'")
+
+
+def resolve_csv_source(use_sample: bool = False) -> str:
+    """
+    Picks the input CSV. Precedence:
+      1. `use_sample=True` (the --sample flag) -> the bundled 20-row fixture.
+      2. $NETFLIX_CSV -> that exact file.
+      3. A full catalog CSV already in the working directory.
+      4. The Kaggle dataset via kagglehub.
+      5. Only if the download is unavailable: the bundled sample, with a warning.
+    """
+    if use_sample:
+        logger.info(f"--sample requested: using '{SAMPLE_CSV_PATH}'")
+        return SAMPLE_CSV_PATH
+
+    override = os.environ.get(CSV_ENV_VAR)
+    if override:
+        if not os.path.exists(override):
+            raise FileNotFoundError(f"{CSV_ENV_VAR} points to a missing file: '{override}'")
+        logger.info(f"Using CSV from ${CSV_ENV_VAR}: '{override}'")
+        return override
+
+    for fname in FULL_CSV_NAMES:
         if os.path.exists(fname):
             logger.info(f"Using local dataset file: '{fname}'")
             return fname
 
-    # Attempt download via kagglehub
     logger.info(f"Attempting to download '{DATASET_ID}' via kagglehub...")
     try:
-        import kagglehub
-        path = kagglehub.dataset_download(DATASET_ID)
-        for fname in CANDIDATE_CSV_NAMES:
-            candidate = os.path.join(path, fname)
-            if os.path.exists(candidate):
-                logger.info(f"Downloaded dataset located at: '{candidate}'")
-                return candidate
-        
-        # If specific filename not found, search for any CSV in download directory
-        for root, _, files in os.walk(path):
-            for f in files:
-                if f.endswith(".csv"):
-                    resolved = os.path.join(root, f)
-                    logger.info(f"Found CSV in downloaded archive: '{resolved}'")
-                    return resolved
-        raise FileNotFoundError(f"No CSV file found in Kaggle download path '{path}'")
-    except ImportError:
-        logger.warning("'kagglehub' package is not installed. To install: pip install kagglehub")
-        raise FileNotFoundError(
-            "Dataset CSV not found locally. Please place 'netflix_titles.csv' or "
-            "'netflix_movies_detailed_up_to_2025.csv' in the project folder, or install kagglehub."
+        import kagglehub  # pyrefly: ignore [missing-import]
+        resolved = _find_csv(kagglehub.dataset_download(DATASET_ID))
+        logger.info(f"Downloaded dataset located at: '{resolved}'")
+        return resolved
+    except Exception as e:  # not installed, offline, no credentials, empty download
+        logger.warning(f"Kaggle download unavailable ({type(e).__name__}: {e})")
+
+    if os.path.exists(SAMPLE_CSV_PATH):
+        logger.warning(
+            "Falling back to the 20-row sample fixture. This is NOT the real dataset; "
+            "install kagglehub / configure Kaggle credentials, or place the full CSV "
+            "in the project folder, to load real data."
         )
+        return SAMPLE_CSV_PATH
+    raise FileNotFoundError(
+        "No dataset available: Kaggle download failed and no sample CSV was found."
+    )
 
 
 def clean_text(val: Optional[str]) -> str:
@@ -154,8 +184,14 @@ def init_database(db_path: str = DB_FILE) -> sqlite3.Connection:
     return conn
 
 
-def load_data(csv_path: str, conn: sqlite3.Connection) -> int:
-    """Reads CSV data and batch loads into SQLite."""
+def load_data(csv_path: str, conn: sqlite3.Connection, reset: bool = False) -> int:
+    """
+    Reads CSV data and batch loads into SQLite.
+
+    With reset=True the table is emptied in the same transaction as the insert, so the
+    database ends up holding exactly this CSV (no leftover rows from earlier loads).
+    An empty CSV never wipes the table.
+    """
     c = conn.cursor()
     rows_to_insert: List[Tuple] = []
 
@@ -195,6 +231,8 @@ def load_data(csv_path: str, conn: sqlite3.Connection) -> int:
             ))
 
     if rows_to_insert:
+        if reset:
+            c.execute("DELETE FROM netflix_titles")
         c.executemany(
             """
             INSERT OR REPLACE INTO netflix_titles (
@@ -209,24 +247,37 @@ def load_data(csv_path: str, conn: sqlite3.Connection) -> int:
     return len(rows_to_insert)
 
 
-def main():
-    logger.info("🎬 Starting Netflix Catalog ETL Pipeline...")
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="Netflix catalog ETL")
+    parser.add_argument(
+        "--sample", action="store_true",
+        help=f"load the bundled 20-row fixture into '{SAMPLE_DB_FILE}' (never touches '{DB_FILE}')",
+    )
+    args = parser.parse_args(argv)
+
+    logger.info("Starting Netflix Catalog ETL Pipeline...")
     try:
-        csv_file = resolve_csv_source()
-        conn = init_database(DB_FILE)
-        count = load_data(csv_file, conn)
-        logger.info(f"✅ Successfully processed and loaded {count:,} records into '{DB_FILE}'")
+        csv_file = resolve_csv_source(use_sample=args.sample)
+        # The sample fixture is kept out of the real database: it gets its own file.
+        is_sample = os.path.basename(csv_file) == SAMPLE_CSV_NAME
+        db_path = SAMPLE_DB_FILE if is_sample else DB_FILE
+        conn = init_database(db_path)
+        count = load_data(csv_file, conn, reset=True)
+        logger.info(f"Loaded {count:,} records from '{csv_file}' into '{db_path}'")
 
         # Quick validation check
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM netflix_titles;")
         total_in_db = c.fetchone()[0]
-        logger.info(f"📊 Verified total records in 'netflix_titles': {total_in_db:,}")
+        logger.info(f"Verified total records in 'netflix_titles': {total_in_db:,}")
 
         conn.close()
-        logger.info("🚀 Database ready. You can now execute 'netflix.sql' or run the FastAPI app!")
+        if is_sample:
+            logger.info(f"Sample DB ready. Point the API at it with NETFLIX_DB_PATH={db_path}")
+        else:
+            logger.info("Database ready. You can now execute 'netflix.sql' or run the FastAPI app!")
     except Exception as e:
-        logger.error(f"❌ ETL Pipeline failed: {e}", exc_info=True)
+        logger.error(f"ETL Pipeline failed: {e}", exc_info=True)
         sys.exit(1)
 
 
