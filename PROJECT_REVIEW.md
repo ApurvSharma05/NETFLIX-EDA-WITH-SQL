@@ -1,42 +1,256 @@
 # Comprehensive Technical Review: Netflix Data Analysis Using SQL
 
 > **Role & Perspective:** Senior AI / Data Engineer Review  
-> **Target Audience:** Technical Recruiters, Data Engineering Hiring Managers, and Startup CTOs  
-> **Repository Assessed:** `NETFLIX-DATA-ANALYSIS-USING-SQL`  
+> **Purpose:** Study guide for interview preparation  
+> **Repository Assessed:** `NETFLIX-DATA-ANALYSIS-USING-SQL` (latest commit `8502442`, plus **uncommitted** fixes made after the first review: `setup.py`, `sample_netflix.csv`, `tests/test_etl.py`, `README.md`)  
 > **Workspace Root:** `d:/Desktop/PROJECTS/NETFLIX EDA`  
-> **Primary File Evaluated:** [setup.py](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py), [netflix.sql](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql), [netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db), [README.md](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md)
+> **Files Evaluated:** `setup.py`, `netflix.sql`, `netflix.db`, `sample_netflix.csv`, `src/api.py`, `src/db.py`, `src/schemas.py`, `tests/`, `Dockerfile`, `docker-compose.yml`, `requirements.txt`, `README.md`  
+> **Verification:** `pytest -q` run before the fixes: 23 passed; after the fixes: **31 passed**. All DB numbers below were queried live from `netflix.db` with `sqlite3`. That file was **not rebuilt** (the full Kaggle CSV is not available locally and no Kaggle download was run), so it still holds the pre-fix mixed load.
+
+---
+
+## Fixed After the First Review
+
+The first build of this project had the four problems below. They are fixed in code and README; the answers in this guide say so honestly ("it was wrong at first, I fixed it"). Do not present them as if they never existed.
+
+| # | Problem found in review | Fix (current code) | Test |
+| :--- | :--- | :--- | :--- |
+| 1 | `resolve_csv_source` checked local CSVs first, so the bundled `sample_netflix.csv` shadowed the Kaggle download | New precedence (`setup.py:L58-101`): `--sample` flag or `$NETFLIX_CSV` forces a file; else a full local CSV; else the Kaggle download; the sample only if the download is unavailable (with a warning). README rewritten to match | `test_resolve_*` (4 tests, `kagglehub` stubbed) |
+| 2 | `sample_netflix.csv` rows `s2` and `s5` had unquoted cast lists, which shifted columns so `date_added` held a name | Cast fields quoted; all 20 rows now have 12 columns and a parseable date | `test_sample_csv_rows_all_parse` |
+| 3 | A real load was an upsert on top of whatever was in `netflix.db`, so sample rows mixed into the real DB | `load_data(..., reset=True)` clears the table in the same transaction as the insert (never on an empty CSV). `main()` always resets, and writes the sample to `netflix_sample.db`, never to `netflix.db` | `test_load_data_reset_*`, `test_main_sample_never_touches_real_db`, `test_main_real_load_does_not_mix_in_sample_rows` |
+| 4 | README claims: "16,000 movies", "online fetches latest, offline sample", "sub-15ms", "pinned dependencies", "Q4 peak", "23 tests" | Corrected or removed (see Claims Check) | n/a |
+
+**Not fixed (and why):**
+- **The existing `netflix.db` was not rebuilt.** It still has 16,020 rows (16,000 Kaggle + 20 sample, including the two old column-shifted rows `s2`/`s5`), so Q5, Q8, Q9, Q11 and B3 still return only sample rows on that file. A clean rebuild needs the Kaggle download (or the full CSV in the project folder) and then `python setup.py`. Neither exists locally and the task excluded downloading, so the DB was left as it was and the README documents this.
+- Q10 grouping, real-data column drift (empty `listed_in`/`duration`, TMDb-score `rating`), CI, batched inserts, normalization, latency measurement, Docker run: unchanged (see Section 6).
+
+---
+
+## Study Guide
+
+How to use this section: read it first. It explains the project in plain language, then drills you on the questions an interviewer is likely to ask. Every claim here was checked against the code or the live `netflix.db`. The later sections (1-7) hold the detail.
+
+### A. The 60-second pitch
+
+I built a small data project around a Netflix-style catalog. A Python script, `setup.py`, cleans a CSV and loads it into a SQLite database. I wrote 20 analytical SQL queries on top of it (15 main questions, 5 bonus). They use window functions and `json_each` to split comma-separated columns. A FastAPI service exposes 8 read-only endpoints with Pydantic response models and parameterized filters. There are 31 pytest tests that run on a 20-row sample file, and a multi-stage Dockerfile for the API. The main thing I learned is data drift: the 2025 dataset I loaded has no genres or durations, so I can say which queries are meaningful on the real data and which only work on the 20 sample rows. Known limits: no CI, no measured performance, a flat (non-normalized) schema, and my local `netflix.db` is still the pre-fix mixed load until I rerun the ETL with the Kaggle download.
+
+### B. How it works, end to end
+
+One real run: `python setup.py`, then `uvicorn src.api:app`, then `GET /api/v1/titles?country=India&limit=5`.
+
+1. **`setup.py: main()`** parses `--sample`, sets up logging, and wraps everything in one `try/except` that logs the traceback and exits with code 1. Why: a failed load must not look like success.
+2. **`resolve_csv_source()`** picks the input CSV in this order: `--sample` flag (bundled fixture) or `$NETFLIX_CSV` (exact file); a full catalog CSV in the current directory (`netflix_movies_detailed_up_to_2025.csv`, `netflix_titles.csv`); the Kaggle download via `kagglehub`; and only if the download fails (not installed, offline, no credentials) the bundled sample, with a warning. Why: a plain run gets real data when it can, offline demos still work. (Before the fix the sample was checked first and shadowed Kaggle.)
+3. **`init_database()`** creates table `netflix_titles` (12 columns, `show_id` primary key), three indexes (`type`, `release_year`, `country`) and the view `netflix`. All use `IF NOT EXISTS`, so it is safe to re-run. Why the view: the column `cast` clashes with SQL's `CAST()`, so the view renames it to `casts`. Analyst SQL and the API both read the view.
+4. **`load_data()`** reads rows with `csv.DictReader`, skips rows with no `show_id`, and cleans each field with `clean_text`, `parse_release_year` and `clean_date_added`. Why: raw CSV values are inconsistent (mixed date formats, floats like `2019.0`). It collects all rows in a list.
+5. **`executemany("INSERT OR REPLACE ...")`** writes the rows in one go, then commits. `main()` passes `reset=True`, so the table is emptied in the same transaction first (not when the CSV is empty). Why: the DB then holds exactly the chosen CSV, with no stale rows from earlier loads; `OR REPLACE` still protects against duplicate ids inside one CSV.
+6. **`main()` picks the target DB and checks `COUNT(*)`.** The sample fixture is written to `netflix_sample.db`; any other source goes to `netflix.db`. Why: the fixture can never pollute the real DB. The count check is a cheap sanity test.
+7. **`uvicorn src.api:app`** starts FastAPI. `src/db.py` reads `NETFLIX_DB_PATH` (default `netflix.db`) once at import.
+8. **A request arrives** at `list_titles` in `src/api.py`. FastAPI validates the query params (`limit` must be 1-100, `release_year` must be an int). Why: bad input is rejected before it reaches SQL.
+9. **`Depends(get_db)`** in `src/db.py` opens a new `sqlite3` connection with `Row` factory, re-runs `CREATE VIEW IF NOT EXISTS netflix`, and closes the connection after the response. Why: simple, safe per-request lifecycle.
+10. **`list_titles` builds the WHERE clause.** For `country=India` it appends `country LIKE :country` and stores `%India%` in a params dict. Values are bound parameters, never concatenated. Only the fixed fragments are joined with an f-string.
+11. **Two queries run:** `COUNT(*)` for `total_matches`, then the page query ordered by `release_year DESC, title ASC` with `LIMIT/OFFSET`. The page query computes `content_label` ('Flagged'/'Standard') in SQL with the Q15 keyword rule.
+12. **Rows become `TitleItem` objects** and are returned inside `TitlesListResponse` (`src/schemas.py`). Pydantic checks the output shape and FastAPI renders it as JSON and as the `/docs` schema.
+
+How tests mirror this: `tests/conftest.py` builds a temp DB with the real `init_database` and `load_data` from `sample_netflix.csv`, then replaces `get_db` through `app.dependency_overrides`.
+
+### C. Key concepts to be able to explain
+
+1. **ETL and idempotent load.** Extract from CSV, transform (clean), load into SQLite. Code: `setup.py` (`load_data`). Idempotent means running twice gives the same result; here via a reset (delete then insert in one transaction) plus `INSERT OR REPLACE` on the primary key. Alternative: `INSERT ... ON CONFLICT DO UPDATE` (a true upsert that does not delete and reinsert), or truncate-and-reload.
+2. **Window functions (`RANK() OVER`).** Compute a value per row using related rows without collapsing them. Code: Q2 in `netflix.sql` and `/dominant-ratings`. Chosen because "top item per group" needs ranking inside each `type`. `RANK` keeps ties. Alternatives: `ROW_NUMBER` (one winner, arbitrary tie-break), `DENSE_RANK`, or a correlated subquery.
+3. **Unnesting with `json_each`.** SQLite has no `UNNEST`. The code turns `"A, B, C"` into the JSON text `["A","B","C"]` and lets `json_each` return one row per element. Code: Q4, Q9, Q14, `/top-countries`. Alternative: bridge tables built in the ETL. Risk: a quote or backslash in the data breaks the JSON.
+4. **First normal form (1NF) and bridge tables.** `director`, `cast`, `country`, `listed_in` hold many values in one cell, so the table is not in 1NF. Chosen for fast ingestion. Alternative: `titles`, `people`, `title_cast`, etc. Trade-off: simpler loading versus awkward queries and `LIKE '%India%'` false matches.
+5. **Compatibility view.** The view `netflix` sits over `netflix_titles` and renames `cast` to `casts`. It lets queries stay stable if the table changes. Defined in three places (`setup.py`, `netflix.sql`, `src/db.py`), which is duplication. Alternative: one migration or a single shared DDL string.
+6. **Bound parameters (SQL injection defence).** Values go through `:name` placeholders, so the driver treats them as data. Code: `list_titles` in `src/api.py`. Alternative: an ORM such as SQLAlchemy, which does the same underneath.
+7. **FastAPI dependency injection and Pydantic.** `Depends(get_db)` gives each request its own connection and closes it. Pydantic models validate and document responses. In tests, `dependency_overrides` swaps in a temp DB. Alternative: Flask (no built-in validation) or a global connection (not safe across threads).
+8. **Index limits.** Three B-tree indexes exist. A `LIKE '%x%'` (leading wildcard) cannot use a B-tree index, and `CASE/SUBSTR` in `WHERE` (Q6) cannot either. Alternative: SQLite FTS5 for text search, bridge tables for exact lookups.
+9. **Data drift.** The code was designed for the classic Netflix schema; the 2025 data differs (movie rating is a TMDb score, `listed_in` and `duration` empty). Handling it meant tolerant column names in `load_data` and the view. Alternative: a schema check (e.g. Pandera or Pydantic) that fails loudly at load time.
+10. **Test fixtures and dependency overrides.** A small known dataset (`sample_netflix.csv`, 20 rows) makes expected results predictable. A test now also checks that every fixture row parses (12 columns, valid date), so a bad fixture cannot silently skew other tests. Trade-off: it tests query logic, not real-data quality.
+
+### D. Design decisions and the honest trade-off
+
+| Decision | Why | Trade-off | What I would do differently |
+| :--- | :--- | :--- | :--- |
+| SQLite | Zero setup, one file, easy to ship and test | Weak concurrency, no arrays, no real `UNNEST` | Keep for the demo; use PostgreSQL if multiple writers or users |
+| Flat denormalized table | Matches the CSV, easy to load | 1NF violations, `json_each` hack, `LIKE` false matches | Bridge tables for country, cast, genre |
+| Compatibility view `netflix` | Stable names for SQL and API; fixes the `cast` clash | View DDL is copied in three files | One shared definition, applied once by the ETL |
+| Reset-then-load with `INSERT OR REPLACE` | Re-runnable load, DB equals the chosen CSV, no stale or sample rows | A full reload replaces everything (no incremental update); `REPLACE` deletes and reinserts | `ON CONFLICT DO UPDATE` if incremental loads are ever needed |
+| Source order: flag/env, local full CSV, Kaggle, sample last | Real data by default; offline demos still work; sample forced only on request | The Kaggle path needs `kagglehub` and credentials and was only tested with a stub here | Add retries and a checksum or row-count check on the download |
+| Sample goes to `netflix_sample.db` | Fixture can never mix into the real DB | The API needs `NETFLIX_DB_PATH` to look at the sample DB | Keep it; tests already use temp DBs |
+| Load all rows into a list first | Simple code | Memory grows with file size | Batch of 5-10k rows, commit per batch |
+| Raw SQL in the API | Transparent, easy to explain, reuses Q1/Q2/Q4/Q10 | Duplicated logic (keyword rule appears in several places); string-built WHERE | Small query layer or SQLAlchemy Core |
+| Keyword flag (`kill`, `violence`) for Q15 | Simple demo of `CASE` | False positives (e.g. "skill"), not real moderation | Word-boundary matching or a classifier, and call it a heuristic |
+| Tests on a 20-row sample | Fast, deterministic | Does not test the real 16k data | Add a few data-quality assertions on the real DB, and CI |
+
+### E. Cross-questioning drills
+
+Format: Opening -> Follow-up -> Harder follow-up -> The trap (what the interviewer is probing). Answers are short and tied to the code.
+
+**1. Weak spot: the Kaggle fallback (fixed after review)**
+- Opening: "Walk me through how the data gets into the database."
+- Follow-up: "So with internet, it downloads from Kaggle?"
+- Harder: "Your first version loaded 20 rows with internet on. Why?"
+- Trap: Do you know your own code, and will you admit a bug and a wrong README claim?
+- Answer: Yes, that was a real bug in the first build. `resolve_csv_source` checked local files first, and `sample_netflix.csv` sits in the repo root, so it won and Kaggle was never contacted; the README described the opposite. I fixed it (`setup.py:L58-101`): `--sample` or `$NETFLIX_CSV` force a file, then a full local CSV, then the Kaggle download, and the sample only if the download is unavailable, with a warning. Four tests cover the order using a stubbed `kagglehub`. Be precise: I have **not** run a real Kaggle download in this review, so I verified the logic, not the network path.
+
+**2. Weak spot: database contents and numbers (partly fixed)**
+- Opening: "How many rows are in your database?"
+- Follow-up: "Your README says 16,000 movies."
+- Harder: "Why do Q5 and Q9 return so few rows?"
+- Trap: Do you know what is really in your data, or did you just trust a README?
+- Answer: My local `netflix.db` has 16,020 rows: 16,000 Kaggle rows plus the 20 sample rows (ids `s1`-`s20`), because the first ETL upserted both into one table. 16,014 Movie and 6 TV Show. The Kaggle rows have empty `listed_in` and `duration`, so Q5, Q8, Q9, Q11 and B3 only return sample rows. I fixed the cause: a real load now resets the table, and the sample goes to `netflix_sample.db`. I did **not** rebuild this file, because that needs the Kaggle download, which I did not run. The README now states 16,020 and the mixed-load caveat.
+
+**3. Weak spot: a query I know is wrong**
+- Opening: "Tell me about Q10, the India trend."
+- Follow-up: "What is the denominator?"
+- Harder: "Is the percentage correct?"
+- Trap: Can you spot a logic bug in your own SQL?
+- Answer: Q10 divides by all India-related rows (534, matched with `country LIKE '%India%'`), but it groups by `country` and `release_year`. So "Austria, India" and exact "India" fall into different groups, and each year's percentage is understated and fragmented. Fix: group by `release_year` only, or unnest countries first. Also `LIKE '%India%'` would match any string containing "India".
+
+**4. Weak spot: malformed sample rows (fixed after review)**
+- Opening: "Any data quality problems you found?"
+- Follow-up: "What did you do about them?"
+- Harder: "Why did B1 show a year bucket like 'lane'?"
+- Trap: Silent data corruption and whether the ETL validates.
+- Answer: In the first `sample_netflix.csv`, rows `s2` and `s5` had unquoted comma-separated cast lists. That shifted columns, so `date_added` held a name, and `clean_date_added` returned unparseable input unchanged, so B1 took the last four characters of that text. I quoted those two fields and added `test_sample_csv_rows_all_parse`, which checks all 20 rows have 12 columns and an ISO-parseable date. Still open: the ETL itself does not reject or quarantine rows with bad dates, and my un-rebuilt `netflix.db` still holds the two old shifted rows.
+
+**5. Scalability**
+- Opening: "What if the CSV were 10 GB?"
+- Follow-up: "And if the table had 50 million rows?"
+- Harder: "What would you change in the API?"
+- Trap: Do you know where it breaks and why?
+- Answer: `load_data` builds the entire row list in memory before `executemany`, so 10 GB would run out of RAM. I would batch 5-10k rows and commit per batch. At 50 million rows, `LIKE '%x%'` filters and `json_each` scans become full scans, and SQLite's single-writer model limits concurrency. I would move to PostgreSQL, normalize into bridge tables with indexes, add FTS or trigram indexes for text search, and use keyset pagination instead of `OFFSET`. I have not benchmarked any of this.
+
+**6. Security**
+- Opening: "Is your API safe from SQL injection?"
+- Follow-up: "But you build the WHERE with an f-string."
+- Harder: "What else is wrong with the API security-wise?"
+- Trap: Whether you understand the difference between interpolating structure and interpolating values.
+- Answer: Filter values are bound parameters (`:country`, `:actor`, ...), with `%` added in Python. The f-string only joins fixed fragments chosen by code, never user text. `limit` is bounded 1-100 and `release_year` is an int. Weaknesses: CORS is `allow_origins=["*"]` together with `allow_credentials=True`, there is no authentication or rate limiting, and `LIKE '%...%'` queries on large tables are a denial-of-service risk. For production I would restrict origins, add an API key and rate limits.
+
+**7. Testing**
+- Opening: "How do you test this?"
+- Follow-up: "Do the tests prove the numbers in your README?"
+- Harder: "What is not tested?"
+- Trap: The difference between "tests pass" and "the system is correct".
+- Answer: 31 tests: 12 ETL, 11 SQL, 8 API (the first build had 23; I added 8 for source selection, sample integrity and sample/real DB separation). `conftest.py` builds a temp DB from the 20-row sample using the real `init_database` and `load_data`, and overrides `get_db`. They check query logic on known data, not the real 16k data, so they do not prove README counts. The Kaggle path is tested only with a stubbed `kagglehub`. Not covered: Q9 and Q11-Q14, Docker, real-data quality, and there is no CI. I would add GitHub Actions running `pytest`, plus a few assertions on the real DB.
+
+**8. "Why not X": SQLite vs PostgreSQL**
+- Opening: "Why SQLite?"
+- Follow-up: "What breaks when you move to PostgreSQL?"
+- Harder: "Would you actually migrate this?"
+- Trap: Whether the choice was reasoned or just convenient.
+- Answer: One file, no server, trivial to test and ship. Cost: no native arrays or `UNNEST`, limited concurrency. For PostgreSQL I would change `json_each` to `UNNEST(STRING_TO_ARRAY(...))` (already sketched in comments for Q4 and Q9), `date_added` to `DATE`, runtime to `INTEGER`, and `STRFTIME` to `EXTRACT`. For a read-mostly demo with one user, I would not migrate. I would if there were concurrent writers or real traffic.
+
+**9. "Why not X": normalization and `json_each`**
+- Opening: "How do you split the comma-separated country column?"
+- Follow-up: "What can go wrong with that?"
+- Harder: "Why not just normalize?"
+- Trap: Do you know the hack is a hack?
+- Answer: Q4 builds `'["' || REPLACE(country, ', ', '","') || '"]'` and passes it to `json_each`. It assumes the separator is exactly `', '` and that no value contains a quote or backslash. Otherwise SQLite raises a JSON error. I would normalize into `title_countries`, `title_cast`, `title_genres` at load time. I did not, because the flat table matched the CSV and kept the ETL simple. The cost is the fragile unnesting and `LIKE` false matches.
+
+**10. "Why not X": ORM, Pandera, pandas**
+- Opening: "Why raw SQL and `csv` instead of pandas or an ORM?"
+- Follow-up: "How do you validate the input data?"
+- Harder: "So 'automated validation' on your resume is accurate?"
+- Trap: Overstating validation.
+- Answer: The data is small and the point was SQL, so raw SQL is the deliverable. Validation is light: cleaning and coercion in the ETL (`clean_text`, `parse_release_year`, `clean_date_added`) and Pydantic on API responses. There is no schema check of the CSV columns. Use the phrase "cleaning and response validation", not "automated data validation". I would add a column and type check at load time.
+
+**11. What did YOU write vs the library**
+- Opening: "What did you write yourself?"
+- Follow-up: "What did FastAPI and Pydantic give you for free?"
+- Harder: "Did an AI tool write any of this? Could you rewrite the key parts without it?"
+- Trap: Whether you understand the code you present.
+- Answer: I wrote the ETL cleaners and load flow, the schema and view, the 20 queries, the endpoint logic and filter builder, and the tests. Libraries supply request parsing, `Query` bounds, JSON serialization, the `/docs` page (FastAPI/Pydantic), CSV parsing (`csv`), and SQL execution (`sqlite3`). Be ready to say plainly how much AI assistance you used (be truthful), and be ready to rebuild `list_titles` or `clean_date_added` on a whiteboard. Reread those two before the interview.
+
+**12. Performance claim (removed after review)**
+- Opening: "How fast is the API?"
+- Follow-up: "An earlier README said sub-15 ms."
+- Harder: "Show me the benchmark."
+- Trap: An unmeasured number presented as fact.
+- Answer: There is no benchmark or timing code in the repo, so that figure was unmeasured; I removed it from the README. What I can reason about: SQLite on a local file with about 16k rows is fast for indexed filters, but `LIKE '%...%'` and `json_each` queries scan every row, so they are slower. The API also opens a new connection and runs `CREATE VIEW IF NOT EXISTS` on each request. To get a real number I would add timing middleware or run `hey`/`wrk`.
+
+**13. Docker and deployment (bonus)**
+- Opening: "How would someone run this from a fresh clone?"
+- Follow-up: "Does `docker compose up` work?"
+- Harder: "What is in the image?"
+- Trap: Whether you tested what you claim.
+- Answer: `netflix.db` is gitignored, so a fresh clone must run `python setup.py` first; compose bind-mounts the DB, otherwise the API starts with no data. I did not run the container build in this review, so say "the Dockerfile has two stages and a `/health` HEALTHCHECK" and not "I verified it". `.dockerignore` does not exclude `*.db`, so `COPY . /app` would bake in a local DB if one exists. Run `docker compose up --build` once before the interview.
+
+### F. Numbers: safe to say vs do not say
+
+| Figure | Status | How to reproduce |
+| :--- | :--- | :--- |
+| 16,020 rows in the current local `netflix.db` (16,000 Kaggle + 20 sample) | Safe, but say it is a pre-fix mixed load that has not been rebuilt | `sqlite3 netflix.db "SELECT COUNT(*) FROM netflix_titles;"` |
+| 16,014 Movie / 6 TV Show | Safe | `SELECT type, COUNT(*) FROM netflix_titles GROUP BY type;` |
+| 20 queries (Q1-Q15, B1-B5) | Safe | Count headers in `netflix.sql` |
+| 8 API endpoints | Safe | Count `@app.get` in `src/api.py` |
+| 31 tests pass (12 ETL + 11 SQL + 8 API) | Safe, with "on a 20-row sample" | `pytest -q` |
+| United States 5,421; Japan 845; UK 802; South Korea 789 | Safe (Q4, after unnesting) | Run Q4 on the live DB |
+| US 7,772 vs International 7,782 (about 50/50); 466 rows have no country | Safe | Run B4 |
+| About 7.1% flagged (1,144 of 16,020) | Safe, call it a keyword heuristic | Run Q15 |
+| October 1,774 and September 1,717 peak months | Safe (say "September and October") | Run B5 |
+| Tyler Perry 20 titles | Safe | Run B2 |
+| 3 indexes, multi-stage Dockerfile, `/health` HEALTHCHECK | Safe (config exists) | Read `setup.py`, `Dockerfile` |
+| "Sub-15 ms" or "sub-10 ms" latency | Do not say. Unmeasured | No benchmark exists |
+| "Pinned dependencies" | Do not say. Only `>=` minimums (README now says so) | `requirements.txt` |
+| "Automated validation" | Hedge: cleaning and response validation only | See drill 10 |
+| "Prefers real data: local full CSV, then Kaggle; sample only if the download fails or on `--sample`" | Safe for the logic (tests with a stubbed `kagglehub`). Do not say "I ran the Kaggle download" | `setup.py:L58-101`, `test_resolve_*` |
+| "The sample never mixes into the real DB" | Safe for new loads (tested). Not true of the current local `netflix.db`, which predates the fix | `test_main_*` |
+| "16,000 movies" alone | Hedge: say "about 16,000 Kaggle rows plus 20 sample rows in my local DB" | See count above |
+| "Q4 peak" | Fixed in README (now "September and October"); do not call it Q4 | B5 |
+| Container works | Unverified. Not run | `docker compose up --build` |
+| Top rating "TV-MA" | Do not say. Movie rating is a TMDb score; Q2 winner is `'0.0'` | Run Q2 |
+
+### G. Things to do before the interview
+
+1. Run `pip install -r requirements.txt`, then `pytest -q` and confirm 31 passed.
+2. In `sqlite3 netflix.db`, rerun the count and type-split queries from section F and Q2, Q4, Q10, B4. Know each output.
+3. In a scratch copy, run `python setup.py --sample` (writes `netflix_sample.db`, leaves `netflix.db` alone). Then run plain `python setup.py` with `kagglehub` installed and Kaggle credentials configured (do not commit them) to rebuild `netflix.db` from the real dataset; recheck the row count and the Q5/Q9 results afterwards.
+4. Start the API: `uvicorn src.api:app`, open `/docs`, call `/health`, `/api/v1/analytics/top-countries`, and `/api/v1/titles?country=India&limit=5`.
+5. Run `docker compose up --build` once so you can state honestly whether it works.
+6. Reread: `setup.py` (`resolve_csv_source`, `load_data`, `clean_date_added`), `src/api.py` (`list_titles`), `src/db.py`, `tests/conftest.py`, and Q2, Q4, Q10, Q15 in `netflix.sql`.
+7. README errors already fixed: source order wording, "16,000 movies", "sub-15 ms", "pinned dependencies", "Q4 peak", test count. Still to be ready to explain: the static "Pytest Passing" badge is not tied to CI.
+8. Remaining quick wins: change Q10 to group by year only, add a GitHub Actions workflow for `pytest`, reject/quarantine rows with unparseable dates in `load_data`. Already done: reordered `resolve_csv_source`, quoted the cast fields in `s2`/`s5`, sample/real DB separation.
+9. Prepare a one-line answer for "how much did AI help?" and for "what would you build next" (bridge tables, CI, measured latency).
 
 ---
 
 ## 1. Overview
 
 ### What the Project Does & The Problem It Solves
-This project represents a data ingestion (ETL) and analytical querying pipeline built around Netflix catalog metadata. In real-world media and streaming organizations (such as Netflix, Hulu, or Amazon Prime Video), content acquisition executives, catalog managers, and recommendation engineers must answer quantitative questions about catalog inventory:
-- What is the proportion of feature films versus episodic television?
-- Which production geographies dominate the library, and where are international expansion gaps?
-- Who are the most frequently recurring creative personnel (directors, key actors)?
-- How has catalog volume scaled over time?
-- Can raw content descriptions be categorized into thematic or sentiment-based safety buckets?
+This project is a Python ETL pipeline, an analytical SQL suite, and a small FastAPI serving layer built around Netflix/TMDb-style catalog metadata. Catalog managers and recommendation engineers need quantitative answers about inventory:
+- What is the split between movies and TV shows?
+- Which production countries dominate the library?
+- Who are the most frequently recurring directors and actors?
+- How has catalog volume changed over time?
+- Can descriptions be bucketed with a simple keyword safety flag?
 
-This repository attempts to answer **15 distinct business questions** and **5 bonus analytical questions** using SQL queries executed against an embedded relational database (SQLite). It uses a Python script ([setup.py](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py)) to pull a dataset from Kaggle via the `kagglehub` package, parse a CSV file, and load records into a local SQLite database ([netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db)), which is then queried using [netflix.sql](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql).
+The repo answers **15 business questions (Q1-Q15)** and **5 bonus questions (B1-B5)** in [netflix.sql](netflix.sql) (375 lines), run against a SQLite file (`netflix.db`). The pipeline works like this:
+1. [setup.py](setup.py) (285 lines) chooses a CSV (flag/env override, a full local CSV, the Kaggle download via `kagglehub`, and the bundled sample only as a last resort).
+2. It cleans the rows and fully reloads them into table `netflix_titles` (sample data goes to `netflix_sample.db` instead), adds three indexes, and creates a compatibility view `netflix`.
+3. Analysts run `netflix.sql`, or consume 8 REST endpoints from `src/api.py`.
+4. 31 pytest tests cover ETL, SQL, and API. A multi-stage `Dockerfile` and `docker-compose.yml` package the API.
 
 ### Who It Is For
-1. **Aspiring Data Engineers and Analytics Engineers:** To demonstrate proficiency in relational data modeling, data transformation, window functions (`RANK() OVER`), aggregate reporting, and multi-valued column unnesting.
-2. **Business Intelligence (BI) Stakeholders:** To provide quick, repeatable SQL query recipes for catalog intelligence.
+1. **Aspiring Data / Analytics Engineers:** shows ETL, window functions (`RANK() OVER`), multi-valued column unnesting, an API layer, tests, and containerization.
+2. **BI Stakeholders:** repeatable SQL recipes plus a queryable API.
 
 ### Tech Stack Table
 
 | Tool / Library | Category | Purpose | Where Used |
 | :--- | :--- | :--- | :--- |
-| **Python 3** | Core Runtime | Ingestion orchestration and CSV extraction | [setup.py](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py) |
-| **`sqlite3`** (Standard Library) | Database Driver | Creating local relational database, executing DDL/DML | [setup.py:L12](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L12) |
-| **`csv`** (Standard Library) | File Parser | Parsing downloaded CSV rows via `csv.DictReader` | [setup.py:L13](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L13), [setup.py:L51](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L51) |
-| **`os`** (Standard Library) | System Utility | Path resolution for downloaded Kaggle dataset artifacts | [setup.py:L14](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L14), [setup.py:L24](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L24) |
-| **`kagglehub`** (External Library) | Data Acquisition | Programmatically fetching remote dataset from Kaggle Hub API | [setup.py:L15](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L15), [setup.py:L23](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L23) |
-| **SQLite Engine (v3)** | Database Management System | File-based embedded relational database storing the catalog | [netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db) |
-| **SQL (ANSI & SQLite Dialects)** | Query Language | Data filtering, window ranking, aggregation, and JSON unnesting | [netflix.sql](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql) |
-| **PostgreSQL Dialect Snippets** | Query Language (Alternative) | PostgreSQL-specific array unnesting functions (`UNNEST`, `STRING_TO_ARRAY`) | [netflix.sql:L85-91](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L85-L91), [netflix.sql:L130-132](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L130-L132) |
-| **Markdown** | Documentation | Project explanation, setup instructions, and resume blurb | [README.md](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md) |
+| **Python 3** (Dockerfile uses 3.11-slim; README badge says 3.10+) | Runtime | ETL, API, tests | `setup.py`, `src/` |
+| **`sqlite3`, `csv`, `logging`, `datetime`, `argparse`** (stdlib) | DB driver / parsing / logging / CLI | DDL+load, `csv.DictReader`, INFO logs with timestamps, date parsing, `--sample` flag | `setup.py` |
+| **`kagglehub`** | Data acquisition | Dataset download (lazy-imported inside `resolve_csv_source`; any failure falls back to the sample with a warning) | `setup.py:L58-101` |
+| **SQLite (v3)** | Database | File DB; table `netflix_titles`, view `netflix`, 3 indexes | `netflix.db` |
+| **SQL (SQLite dialect)** | Query language | Window functions, `json_each` unnesting, `CASE`, scalar subqueries | `netflix.sql` |
+| **PostgreSQL snippets** | Alternative dialect | Q4 and Q9 `UNNEST(STRING_TO_ARRAY(...))`, now **commented out** | `netflix.sql:L102-109`, `L192-194` |
+| **FastAPI + Uvicorn** | Web framework | 8 GET endpoints, Swagger at `/docs`, ReDoc at `/redoc`, CORS middleware | `src/api.py` |
+| **Pydantic v2** | Validation | Response models (`HealthResponse`, `TitleItem`, `TitlesListResponse`, etc.) | `src/schemas.py` |
+| **pytest + httpx/Starlette `TestClient`** | Testing | 31 tests, in-memory/tmp DB fixtures, `dependency_overrides`, `monkeypatch` (stubbed `kagglehub`) | `tests/` |
+| **Docker / Docker Compose** | Packaging | Multi-stage build, `/health` HEALTHCHECK, port 8000, bind-mounts `netflix.db` | `Dockerfile`, `docker-compose.yml` |
+
+`requirements.txt` uses minimum-version pins (`>=`), not exact pins. It also lists `pydantic-settings` and `python-dotenv`, which no code imports.
 
 ---
 
@@ -44,71 +258,47 @@ This repository attempts to answer **15 distinct business questions** and **5 bo
 
 ### Step-by-Step Data & Control Flow
 
-1. **Extraction (Kaggle Hub API):**
-   - The user executes `python setup.py`.
-   - `kagglehub.dataset_download("bhargavchirumamilla/netflix-movies-and-tv-shows-till-2025")` contacts the Kaggle dataset repository and downloads the archive to a local system cache directory.
-2. **File Resolution & Validation:**
-   - [setup.py:L24-27](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L24-L27) constructs the absolute path to `netflix_movies_detailed_up_to_2025.csv` and performs a basic `os.path.exists` check.
-3. **Database Initialization (DDL):**
-   - A connection is established to [netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db).
-   - [setup.py:L32-48](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L32-L48) drops any existing table named `netflix_titles` and executes `CREATE TABLE netflix_titles` with 12 text/integer columns.
-4. **Data Transformation & Ingestion (ETL Batch Load):**
-   - [setup.py:L50-68](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L50-L68) reads the entire CSV file into memory as a list of Python tuples via `csv.DictReader`. It coerces `release_year` to an integer while preserving all other values as raw text.
-   - [setup.py:L70-73](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L70-L73) executes `c.executemany("INSERT OR IGNORE INTO netflix_titles VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)` and commits the transaction to disk.
-5. **Analytical Query Layer:**
-   - The analyst opens [netflix.sql](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql) in an external SQL client (e.g., DB Browser for SQLite, DBeaver, or VS Code SQLite Extension).
-   - The queries execute analytical calculations (aggregations, window functions, and string splitting) against the stored tables.
+1. **Source resolution (`resolve_csv_source`, [setup.py:L58-101](setup.py)):** first match wins.
+   - `--sample` flag: the bundled `sample_netflix.csv` (path resolved next to `setup.py`).
+   - `$NETFLIX_CSV`: that exact file (error if it does not exist).
+   - A full catalog CSV in the **current directory**: `netflix_movies_detailed_up_to_2025.csv`, then `netflix_titles.csv`.
+   - The Kaggle download: lazy `import kagglehub`, `dataset_download("bhargavchirumamilla/netflix-movies-and-tv-shows-till-2025")`, then `_find_csv` (L45-55) looks for a known name, else any `.csv`.
+   - Only if the download raises (not installed, offline, no credentials, empty download) it logs a warning and falls back to the bundled sample. If even that is missing it raises `FileNotFoundError`.
+2. **Schema init (`init_database`, [setup.py:L136-184](setup.py)):** `CREATE TABLE IF NOT EXISTS netflix_titles` (12 columns, `show_id` PRIMARY KEY, `type`/`title` NOT NULL), indexes `idx_titles_type`, `idx_titles_release_year`, `idx_titles_country`, and `CREATE VIEW IF NOT EXISTS netflix` that renames `[cast]` to `casts`.
+3. **Clean and load (`load_data`, [setup.py:L187-245](setup.py)):**
+   - It reads the CSV with `csv.DictReader` (`errors="replace"`) and skips rows with no `show_id`/`id`.
+   - It applies `clean_text` (strip), `parse_release_year` (`int(float(x))`, else `None`), and `clean_date_added` (ISO passthrough or `%B %d, %Y` / `%b %d, %Y` / `%d-%b-%y` to ISO).
+   - It accepts alternate column names: `id`, `casts`, `genres`, `overview`.
+   - It buffers all rows in a list. If any rows were read, it optionally runs `DELETE FROM netflix_titles` (`reset=True`), then one `executemany("INSERT OR REPLACE ...")` (L238) and commits, all in one transaction. An empty CSV never wipes the table.
+4. **`main(argv)` ([setup.py:L250-282](setup.py)):** parses `--sample`, resolves the CSV, and chooses the target DB: `netflix_sample.db` if the CSV is the bundled sample, else `netflix.db`. It loads with `reset=True`, verifies `COUNT(*)`, and calls `sys.exit(1)` on any exception (broad `try/except` with `exc_info`).
+5. **Query layer:** `netflix.sql` runs in DB Browser, the SQLite CLI, or Python against the `netflix` view.
+6. **Serving layer:** `src/db.py` (`get_db`) opens a `sqlite3.Row` connection per request and re-issues `CREATE VIEW IF NOT EXISTS netflix`. `src/api.py` runs SQL against the view and returns Pydantic models. DB path comes from env `NETFLIX_DB_PATH` (default `netflix.db`).
 
 ```mermaid
 flowchart TD
-    subgraph S1["1. Remote Data Source"]
-        Kaggle["Kaggle API Repository<br>bhargavchirumamilla/netflix-movies-and-tv-shows-till-2025"]
-    end
-
-    subgraph S2["2. Ingestion & ETL Layer (setup.py)"]
-        KH["kagglehub.dataset_download()"]
-        CSVFile["netflix_movies_detailed_up_to_2025.csv<br>(16,000 Rows)"]
-        Reader["csv.DictReader (Python)"]
-        CastTransform["Transform release_year -> INT<br>Map columns to 12-field Tuples"]
-    end
-
-    subgraph S3["3. Relational Storage Layer (netflix.db)"]
-        SQLiteDB[("SQLite Database<br>netflix.db")]
-        T_Titles["Table: netflix_titles<br>(Created by setup.py)<br>Columns: show_id, type, title, director, cast, country..."]
-        T_Netflix["Table: netflix<br>(Expected by netflix.sql)<br>Columns: show_id, type, title, director, casts, country..."]
-        Mismatch{{"CRITICAL SCHEMA MISMATCH<br>Table name: netflix_titles vs netflix<br>Column name: cast vs casts"}}
-    end
-
-    subgraph S4["4. Analytical & Serving Layer (netflix.sql)"]
-        Q_Agg["Aggregation & Grouping<br>(Q1, Q3, Q10, B1, B2)"]
-        Q_Window["Window Functions<br>RANK() OVER (...)<br>(Q2)"]
-        Q_JSON["JSON Unnesting<br>json_each(...)<br>(Q4, Q9, Q14)"]
-        Q_Case["Conditional Classification<br>CASE WHEN ...<br>(Q15, B3, B4)"]
-        Q_PG["PostgreSQL Unnesting<br>UNNEST(STRING_TO_ARRAY)<br>(Q4, Q9 - syntax error on SQLite)"]
-    end
-
-    Kaggle --> KH
-    KH --> CSVFile
-    CSVFile --> Reader
-    Reader --> CastTransform
-    CastTransform -->|"executemany INSERT"| T_Titles
-    T_Titles -.-> Mismatch
-    Mismatch -.-> T_Netflix
-    T_Netflix --> Q_Agg
-    T_Netflix --> Q_Window
-    T_Netflix --> Q_JSON
-    T_Netflix --> Q_Case
-    T_Netflix --> Q_PG
+    Override["--sample flag / $NETFLIX_CSV"] --> ETL
+    Local["Full local CSV in CWD\nnetflix_titles.csv"] --> ETL
+    Kaggle["Kaggle (kagglehub)\nif no local full CSV"] --> ETL
+    Sample["sample_netflix.csv\nlast resort if download fails"] --> ETL
+    ETL["setup.py\nclean_text / parse_release_year / clean_date_added\nreset + INSERT OR REPLACE"] --> T[("netflix_titles\n+3 indexes\n(sample goes to netflix_sample.db)")]
+    T --- V["View: netflix\n(cast AS casts)"]
+    V --> SQL["netflix.sql\nQ1-Q15, B1-B5"]
+    V --> API["src/api.py FastAPI\n8 endpoints"]
+    V --> TESTS["tests/ (23)"]
+    API --> D["Docker / compose :8000"]
 ```
 
 ### Folder & File Map
 
-- [README.md](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md): Project overview, documentation, business question catalog, claimed findings, and resume blurb.
-- [setup.py](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py): Automated database initialization script downloading Kaggle data and creating SQLite database `netflix.db`.
-- [netflix.sql](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql): 340-line SQL script defining the relational schema and containing 15 business queries + 5 bonus queries.
-- [netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db): Local SQLite binary database containing 16,000 movie records ingested from Kaggle into table `netflix_titles`.
-- `.git/`: Version control directory containing Git history (branches `main`, remote `origin/main`).
-- **Noticeably Missing Files:** No [requirements.txt](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/requirements.txt), no `pyproject.toml`, no `Dockerfile`, no automated test files (`tests/`), and no CI/CD configuration (`.github/workflows/`).
+- `README.md` (206 lines): overview, mermaid, structure, quick start (source order, sample/real DB separation, "Rebuilding `netflix.db`"), Q table, findings, API table, resume bullets. File names, commands and numbers now match the repo and the live DB.
+- `setup.py` (285 lines): ETL (see above).
+- `netflix.sql` (375 lines): DDL + compat view, preview queries, Q1-Q15, B1-B5. PostgreSQL alternatives are commented out.
+- `netflix.db`: SQLite file, **16,020 rows** (see Section 4), the pre-fix mixed load; **not rebuilt**. It is **gitignored and untracked** (`.gitignore` has `*.db`), so it exists only locally. `netflix_sample.db` (also covered by `*.db`) is created only when the sample is loaded.
+- `sample_netflix.csv`: 20-row fixture (14 Movies, 6 TV Shows) used by the tests; `s2` and `s5` repaired (cast quoted).
+- `src/api.py`, `src/db.py`, `src/schemas.py`: API, connection dependency, Pydantic models.
+- `tests/`: `conftest.py` (59 lines), `test_etl.py` (12 tests, 184 lines), `test_sql_queries.py` (11 tests), `test_api.py` (8 tests).
+- `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.gitignore`, `requirements.txt`, `PROJECT_REVIEW.md`.
+- **Still missing:** `pyproject.toml`, CI (`.github/workflows/` does not exist), and any lock file.
 
 ---
 
@@ -116,112 +306,98 @@ flowchart TD
 
 ### Module-by-Module Walkthrough
 
-#### Ingestion Script: [setup.py](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py)
-1. **Dependency Import & Configuration ([setup.py:L1-19](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L1-L19)):**  
-   Imports Python standard libraries (`sqlite3`, `csv`, `os`) and the external third-party package `kagglehub`. Defines hardcoded constants:
-   - `DB_FILE = "netflix.db"`
-   - `DATASET_ID = "bhargavchirumamilla/netflix-movies-and-tv-shows-till-2025"`
-   - `CSV_FILENAME = "netflix_movies_detailed_up_to_2025.csv"`
-2. **Download Routine ([setup.py:L21-28](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L21-L28)):**  
-   Calls `kagglehub.dataset_download(DATASET_ID)` which fetches the dataset to the user's OS cache. Verifies file existence using `os.path.exists(csv_file)`. If missing, raises `FileNotFoundError`.
-3. **Database Schema Creation ([setup.py:L29-48](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L29-L48)):**  
-   Opens a connection to `netflix.db` and drops `netflix_titles` if it exists. Recreates `netflix_titles` with columns:
-   `show_id` (PRIMARY KEY), `type`, `title`, `director`, `cast`, `country`, `date_added`, `release_year`, `rating`, `duration`, `listed_in`, `description`.
-4. **Data Reading & Ingestion ([setup.py:L50-76](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L50-L76)):**  
-   Iterates through rows via `csv.DictReader(f)`, building an in-memory list of tuples `rows`. Converts `release_year` to an integer if populated, defaulting empty fields to `""`. Executes `c.executemany("INSERT OR IGNORE INTO netflix_titles VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)`, commits the transaction, logs record count, and closes the connection.
+#### ETL: [setup.py](setup.py)
+- **Config (L30-43):** `DB_FILE`, `SAMPLE_DB_FILE`, `DATASET_ID`, `FULL_CSV_NAMES`, `SAMPLE_CSV_PATH` are module constants. Only the CSV choice is overridable (`--sample`, `$NETFLIX_CSV`).
+- **Cleaners (L104-133):** pure functions, unit-tested in `tests/test_etl.py` (`clean_text`, `parse_release_year`, `clean_date_added`).
+- **`init_database`** is idempotent (`IF NOT EXISTS`). It does **not** drop existing data.
+- **`load_data`** uses `INSERT OR REPLACE`, so a duplicate `show_id` inside one load is replaced instead of failing. With `reset=True` (what `main()` uses) it first deletes all rows in the same transaction, so the DB equals the CSV. It buffers all rows in memory first.
 
-#### Analytical Queries: [netflix.sql](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql)
-The SQL file is structured into DDL, preview queries, 15 core business questions, and 5 bonus queries:
+#### Analytical SQL: [netflix.sql](netflix.sql)
+- **Schema/view block (L13-43):** same DDL as `setup.py`, plus the `netflix` view (`cast AS casts`, because `cast` collides with `CAST()`).
+- **Q1 (L58):** `GROUP BY type`.
+- **Q2 (L69-86):** `RANK() OVER (PARTITION BY type ORDER BY COUNT(*) DESC)` in a derived table, filtered to `ranking = 1`.
+- **Q3 (L88):** `type='Movie' AND release_year = 2020`.
+- **Q4 (L98-120):** active SQLite version unnests with `json_each('["' || REPLACE(country, ', ', '","') || '"]')`. The PostgreSQL `UNNEST/STRING_TO_ARRAY` version is commented out.
+- **Q5 (L123):** strips `' min'`, casts to INTEGER, `ORDER BY ... LIMIT 1`.
+- **Q6 (L137-150):** date-format-aware `CASE` (ISO `____-__-__` uses chars 1-4, otherwise the last 4 chars), compared to `STRFTIME('%Y','now') - 5`.
+- **Q7 (L156), Q8 (L165), Q11 (L219), Q12 (L229), Q13 (L238):** `LIKE`/`TRIM`/`CAST` filters.
+- **Q9 (L178-196):** `json_each` unnesting of `listed_in`.
+- **Q10 (L198-216):** `WHERE country='India' OR country LIKE '%India%'`, `GROUP BY country, release_year`, percentage via scalar subquery.
+- **Q14 (L250):** `json_each` on `casts`, India filter, top 10.
+- **Q15 (L267-300):** `CASE WHEN description LIKE '%kill%' OR '%violence%' THEN 'Bad' ELSE 'Good'`, an aggregate and a per-row version.
+- **B1-B5 (L305-375):** ISO-aware year/month extraction (B1, B5), top directors (B2), runtime buckets (B3), `LIKE '%United States%'` US-vs-international (B4).
 
-- **DDL Definition ([netflix.sql:L13-26](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L13-L26)):**  
-  Defines `CREATE TABLE netflix (...)` with column widths (e.g., `VARCHAR(550)`). Notably, the table name is `netflix` (not `netflix_titles`) and the actor column is `casts` (not `cast`).
-- **Q1: Content Type Breakdown ([netflix.sql:L44-48](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L44-L48)):**  
-  `SELECT type, COUNT(*) AS total_content FROM netflix GROUP BY type;`  
-  Calculates volume by content classification.
-- **Q2: Dominant Rating via Window Function ([netflix.sql:L55-68](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L55-L68)):**  
-  Uses `RANK() OVER (PARTITION BY type ORDER BY COUNT(*) DESC) AS ranking` within an inline derived table `ranked`, filtering `WHERE ranking = 1` to extract the mode rating per type.
-- **Q3: Specific Release Year Filtering ([netflix.sql:L74-78](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L74-L78)):**  
-  Filters `type = 'Movie' AND release_year = 2020`.
-- **Q4: Geographic Concentration ([netflix.sql:L84-103](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L84-L103)):**  
-  Demonstrates multi-valued delimiter splitting.  
-  - *PostgreSQL block ([netflix.sql:L85-91](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L85-L91)):* Calls `UNNEST(STRING_TO_ARRAY(country, ','))`.  
-  - *SQLite block ([netflix.sql:L94-103](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L94-L103)):* Converts the comma-separated string into a JSON array string `json_each('["' || REPLACE(country, ', ', '","') || '"]')` and performs a virtual table cross-join to unnest items.
-- **Q5: Maximum Movie Runtime ([netflix.sql:L109-117](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L109-L117)):**  
-  Strips `' min'` suffix via `REPLACE`, casts to `INTEGER`, orders descending, and takes `LIMIT 1`.
-- **Q6: Rolling 5-Year Additions ([netflix.sql:L123-132](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L123-L132)):**  
-  Extracts the last 4 characters of `date_added` via `SUBSTR(TRIM(date_added), -4)` and compares against `STRFTIME('%Y', 'now') - 5`.
-- **Q7: Creator Search ([netflix.sql:L138-141](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L138-L141)):**  
-  Performs substring matching `WHERE director LIKE '%Rajiv Chilaka%'`.
-- **Q8: TV Show Season Threshold ([netflix.sql:L147-154](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L147-L154)):**  
-  Strips `' Seasons'` and `' Season'` from `duration`, casts to integer, and checks `> 5`.
-- **Q9: Genre Breakdown ([netflix.sql:L161-174](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L161-L174)):**  
-  Unnests `listed_in` using the `json_each` JSON array simulation trick.
-- **Q10: Country-Specific Historical Trend ([netflix.sql:L181-195](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L181-L195)):**  
-  Filters `country = 'India'`, groups by `release_year`, and calculates the percentage of total Indian content using a scalar subquery `(SELECT COUNT(show_id) FROM netflix WHERE country = 'India')`.
-- **Q11: Genre Specific Search ([netflix.sql:L201-205](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L201-L205)):**  
-  Searches for documentary movies using `listed_in LIKE '%Documentaries%' AND type = 'Movie'`.
-- **Q12: Data Quality / Missing Value Audit ([netflix.sql:L211-214](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L211-L214)):**  
-  Finds records where `director IS NULL OR TRIM(director) = ''`.
-- **Q13: Talent Temporal Analysis ([netflix.sql:L221-226](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L221-L226)):**  
-  Checks `casts LIKE '%Salman Khan%' AND release_year > (STRFTIME('%Y', 'now') - 10)`.
-- **Q14: Top Regional Actors ([netflix.sql:L233-243](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L233-L243)):**  
-  Unnests `casts` using `json_each` filtered by `country LIKE '%India%'`, grouped by actor, and ordered by frequency.
-- **Q15: Sentiment & Content Moderation Flagging ([netflix.sql:L250-278](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L250-L278)):**  
-  Evaluates description keywords: `CASE WHEN description LIKE '%kill%' OR description LIKE '%violence%' THEN 'Bad' ELSE 'Good' END`. Provides both an aggregate summary and a per-row labeled view.
-- **Bonus Queries B1 to B5 ([netflix.sql:L285-340](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L285-L340)):**  
-  - `B1`: Catalog additions by year (`SUBSTR(TRIM(date_added), -4)`).  
-  - `B2`: Most prolific directors (`COUNT(show_id) GROUP BY director`).  
-  - `B3`: Runtime distribution bucketing into 5 duration tiers.  
-  - `B4`: Domestic (US) vs. International catalog ratio.  
-  - `B5`: Peak upload month analysis parsing `SUBSTR(date_added, 1, INSTR(date_added, ' ') - 1)`.
+#### API: [src/api.py](src/api.py)
+
+| Endpoint | Backing query |
+| :--- | :--- |
+| `GET /health` | `COUNT(*)` on `netflix`; 503 on DB error |
+| `GET /api/v1/metrics` | totals, movie/TV counts, distinct countries, year range |
+| `GET /api/v1/analytics/content-split` | Q1 |
+| `GET /api/v1/analytics/dominant-ratings` | Q2 (`RANK()`) |
+| `GET /api/v1/analytics/top-countries?limit=` | Q4 (`json_each`) |
+| `GET /api/v1/analytics/india-trends?limit=` | Q10 |
+| `GET /api/v1/titles` | filters: type, country, actor, director, release_year, classification (`Standard`/`Flagged`), search; `limit` 1-100, `offset`; returns `total_matches` |
+| `GET /api/v1/titles/{show_id}` | one title, 404 if missing |
+
+Filters use **named bind parameters** (`:type`, `:country`, ...), so user input is not string-concatenated into SQL. Only the static `WHERE` skeleton is built with an f-string. `content_label` ('Flagged'/'Standard') is computed in SQL.
+
+#### Tests: [tests/](tests)
+- `conftest.py`: session fixture builds a temp DB via `init_database` + `load_data(sample_netflix.csv)`. The `client` fixture overrides `get_db` via `app.dependency_overrides`.
+- **They test the sample CSV, not the real 16k dataset**, so they check query logic, not real-data quality.
+- 12 ETL (4 cleaners/schema + 1 sample-integrity + 4 source-resolution + 3 reset/sample-vs-real-DB) + 11 SQL (Q1-Q8, Q10, Q15, bonus) + 8 API = **31**. Q9, Q11-Q14 have no dedicated SQL test. The Kaggle path is exercised only with a stubbed `kagglehub` module (no network).
 
 ### Key Design Decisions & Technical Trade-offs
 
-1. **Embedded SQLite vs. Dedicated Client-Server RDBMS (PostgreSQL / MySQL):**  
-   - *Advantage:* Zero setup required, no network listener, entirely portable database file ([netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db)), easy to open in lightweight tools.  
-   - *Trade-off:* Lack of built-in array datatypes, no native `UNNEST` or `STRING_TO_ARRAY`, and limited concurrency support.
-2. **Denormalized Flat Table vs. Normalized Relational Schema (3NF):**  
-   - The dataset violates 1NF (First Normal Form) by storing comma-delimited strings in `director`, `cast`, `country`, and `listed_in`.  
-   - *Advantage:* Fast, direct ingestion from raw CSV without creating junction/bridge tables (`title_directors`, `title_actors`, `title_genres`).  
-   - *Trade-off:* Extremely fragile queries. Unnesting multi-valued strings requires hacky JSON array formatting (`json_each('["' || REPLACE(...) || '"]')`), and simple string searches (`LIKE '%India%'`) risk false positives (e.g., matching "Indiana").
-3. **Simulating Array Operations via `json_each` in SQLite:**  
-   - *Trade-off:* While clever, if any title, actor name, or country contains double quotes or unescaped characters, SQLite's JSON parser crashes with `JSON error: syntax error`.
+1. **SQLite vs. client-server RDBMS:** zero setup and a portable file. No native arrays, limited concurrency.
+2. **Compatibility view `netflix` over `netflix_titles`:** the ETL owns the canonical table; analyst SQL and the API use the stable view with `casts`. This fixed the old table/column mismatch. Cost: one more object to keep in sync (`setup.py` and `db.py` both define the view).
+3. **Denormalized flat table:** multi-valued strings in `director`, `cast`, `country`, `listed_in` violate 1NF. Ingestion is simple, but unnesting needs the `json_each` string hack, and `LIKE '%India%'` can match unintended strings.
+4. **Real-data-first CSV resolution with a sample fallback:** a plain run uses a full local CSV or the Kaggle download; the sample is used only on `--sample` or when the download is unavailable, and is written to its own `netflix_sample.db`. (This was the other way round in the first build.)
+5. **Full reload (`reset=True` + `INSERT OR REPLACE`):** the DB always equals the chosen CSV. Trade-off: there is no incremental update, and a failed run after the delete is rolled back with the transaction, but a successful run of a bad CSV does replace good data.
 
 ### Prompts, LLM Architecture & AI Models
-- **Clarification:** There are **NO LLMs, generative models, prompt templates, or AI API calls** in this repository.
-- This is a deterministic data engineering and SQL analytics project. Any resume claim framing this as an "AI system" or "LLM pipeline" is completely false based on the codebase. (See Section 7 for recommendations on how to genuinely add a modern Text-to-SQL or Semantic Search layer).
+- **No LLMs, prompts, or AI API calls exist in this repo.** It is a deterministic ETL / SQL / API project. Any "AI system" framing would be false.
 
-### Error Handling, Logging, Validation & Secrets Management
+### Error Handling, Logging, Validation & Secrets
 
-| Area | Current Implementation Status in Code | Senior Engineer Critique & Risk Assessment |
+| Area | Current implementation | Critique |
 | :--- | :--- | :--- |
-| **Error Handling** | Only a basic `os.path.exists` check in [setup.py:L26](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L26). No `try/except` blocks around network downloads, CSV parsing, or database execution. | Unhandled network exceptions from `kagglehub` or corrupted CSV rows will immediately crash the script with an unhandled stack trace. |
-| **Retries** | None. | Network latency or Kaggle API timeouts will fail without backoff or retry logic. |
-| **Validation** | Minimal: `int(row["release_year"]) if row.get("release_year") else None`. | No schema enforcement, no validation on date formats, null checks, or character encoding validation. |
-| **Logging** | Three `print()` statements in [setup.py](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py) (`print("📥...")`, `print("✅...")`). | No structured logging (`logging` or `structlog`), no timestamps, no log levels (`INFO`, `ERROR`), and no log destination other than stdout. |
-| **Config & Secrets** | Hardcoded strings in [setup.py](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py) (`DATASET_ID`, `CSV_FILENAME`, `DB_FILE`). | No environment variables, `.env` file, or configuration management (e.g., `pydantic-settings`). `kagglehub` relies implicitly on global credentials. |
+| **Error handling** | `main()` wraps everything in `try/except`, logs with traceback, exits 1. `resolve_csv_source` handles missing `kagglehub`. API returns 503 (health) / 404 (by id). | Coarse: no per-row error handling, no handling for malformed CSV rows. |
+| **Retries** | None for Kaggle download. | A network failure aborts the run. |
+| **Validation** | Type coercion and trimming in ETL. Pydantic response models and `Query` bounds in the API. | No schema/contract check on CSV columns; bad dates pass through unchanged. |
+| **Logging** | `logging` with timestamp/level (INFO/WARNING/ERROR) in `setup.py`; emojis in messages. | Plain-text logs, not structured JSON; the API has no request logging or timing. |
+| **Config & secrets** | `NETFLIX_DB_PATH` env var for the API. Everything in `setup.py` is hardcoded. `.env` is gitignored. | `kagglehub` credentials are implicit (global config). No secrets are in the repo. |
 
 ---
 
 ## 4. Claims Check
 
-An audit of every quantitative claim made in [README.md](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md) compared directly against the actual codebase and the underlying database file ([netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db)):
+Every quantitative claim in `README.md` was re-checked against the live `netflix.db` and `netflix.sql`, and the README was corrected after the first review (the "README now" column).
 
-| Claim in README / Resume | Quoted Text from README | Verified in Repo? | Forensic Verification & Reality in Database |
+**Key fact for interviews:** the current local `netflix.db` has **16,020 rows = 16,000 TMDb-style movie rows + the 20 `sample_netflix.csv` rows** (ids `s1`-`s20`, loaded into the same table by the pre-fix `INSERT OR REPLACE`). The 6 "TV Show" rows, all non-empty `listed_in`/`duration` values, and 14 of the genres come only from these sample rows. The ETL no longer does this mixing, but the file has **not been rebuilt** (needs the Kaggle download).
+
+| Claim | Source | Verified? | Reality in `netflix.db` / code (README now) |
 | :--- | :--- | :--- | :--- |
-| **Dataset Volume (Resume & Overview)** | *"8,000+ titles"* ([README.md:L91](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md#L91)) | ❌ **Discrepancy / Unverified** | The database committed in the repo ([netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db)) contains exactly **16,000 records**, not 8,000+. The classic Kaggle dataset by Shivam Bansal has 8,807 titles, but `setup.py` downloads `bhargavchirumamilla/...` which has 16,000. |
-| **Number of Queries** | *"20+ SQL queries"* ([README.md:L91](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md#L91)) | ✅ **Verified in Script** | [netflix.sql](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql) contains exactly 20 distinct queries: 15 numbered business questions (Q1–Q15) plus 5 bonus queries (B1–B5). |
-| **Content Split** | *"Netflix has more Movies than TV Shows"* ([README.md:L67](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md#L67)) | ❌ **Contradicted by DB** | In [netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db), **100% of titles (16,000 out of 16,000) are 'Movie'**. There are **0 TV Shows**. This claim was copied from the older 8,807 Kaggle dataset without verifying the downloaded data. |
-| **Most Common Rating** | *"TV-MA dominates both Movies and TV Shows"* ([README.md:L68](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md#L68)) | ❌ **Contradicted by DB** | Ratings in [netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db) are numerical TMDb scores (e.g. `'6.0'`, `'6.5'`, `'0.0'`). The most common rating is `'0.0'` (899 rows). `'TV-MA'` does not appear in the database. |
-| **Top Country** | *"United States leads, followed by India and United Kingdom"* ([README.md:L69](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md#L69)) | ⚠️ **Partially True / Buggy** | In [netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db), top countries are: United States of America (5,421), Japan (845), South Korea (789), France (612), UK (581), India (419). India is 6th, not 2nd. Furthermore, Bonus Query B4 checks `country = 'United States'`, returning 97.1% 'International' because the string in the DB is `'United States of America'`. |
-| **Top Genres** | *"Dramas, Comedies, and Documentaries appear most frequently"* ([README.md:L70](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md#L70)) | ❌ **Contradicted by DB** | In [netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db), the `listed_in` column is **100% empty strings (`''`) across all 16,000 records**. Query Q9 and Q11 return 0 results or blank genres. |
-| **Content Without Directors** | *"A notable portion — mostly stand-up specials and reality formats"* ([README.md:L71](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md#L71)) | ❌ **Unverified Speculation** | Only 132 out of 16,000 titles (0.8%) lack a director. Because `listed_in` is empty and there are no TV shows, attributing this to stand-up or reality formats is completely unsupported by data. |
-| **India Content Addition Trend** | *"2018–2020 saw the highest average content additions from India"* ([README.md:L72](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md#L72)) | ❌ **Contradicted by DB** | Running Q10 against [netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db) yields 2025 (15.04%), 2024 (9.07%), and 2012 (8.11%) as the top years. |
-| **File Names Stated in README** | `netflix_analysis.sql` and `setup_database.py` ([README.md:L21-22](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/README.md#L21-L22)) | ❌ **Contradicted by Repo** | The actual files in the repository are named [netflix.sql](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql) and [setup.py](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py). Anyone following the README instructions gets `python: can't open file 'setup_database.py': [Errno 2] No such file or directory`. |
+| "16,000 movie titles ingested", "16,000 Records" (original README) | README Key Findings + mermaid | ✅ **Fixed in README** | `COUNT(*)` = **16,020**. 16,000 non-sample rows (ids numeric) + 20 sample rows. Type split: **16,014 Movie / 6 TV Show**. README now states 16,020 with the mixed-load caveat and a "Rebuilding `netflix.db`" section; the mermaid no longer shows a row count. |
+| "1,000 titles per year (2010-2025)" | README | ✅ (for the Kaggle rows) | Year additions B1 show 1,000 per year for 2010-2025. Total `release_year` range is 1993-2025 because the sample rows include older films. README now says "1,000 Kaggle titles per added-year". |
+| "15 questions + 5 advanced" / "20 analytical queries" | README | ✅ | `netflix.sql` has Q1-Q15 and B1-B5 (20 queries). |
+| "United States leads (5,421), Japan (845), UK (802), South Korea (789)" | README | ✅ | Q4 (unnested) on the live DB returns: United States of America 5,421; Japan 845; United Kingdom 802; South Korea 789; Canada 676. (Raw `GROUP BY country` shows UK as 582 because of co-productions.) |
+| "~50.0% US vs 50.0% international" | README | ✅ | B4 returns International 7,782 (50.0%) / US Content 7,772 (50.0%). It works because B4 now uses `LIKE '%United States%'` (the old exact-match bug is fixed). Note 466 rows have empty country and are excluded. |
+| "Q4 (October and September) peak uploads" (original README) | README | ✅ **Fixed in README** | B5: October 1,774; September 1,717; March 1,580. README now says "September and October" (September is Q3, so "Q4" was wrong). |
+| "Tyler Perry (20), Steven Soderbergh (15), Sean McNamara (15)" | README | ✅ | B2 top 5: Tyler Perry 20, Steven Soderbergh 15, Sean McNamara 15, Roel Reine 15, Choi Woo-seong 14. |
+| "~7.1% flagged keywords" | README | ✅ | Q15: Bad 1,144 / Good 14,876 of 16,020 = 7.14%. README now gives the counts and says it is a keyword heuristic. |
+| "Top ratings: TV-MA dominates" (old claim) | removed from README | n/a | **Not in README now.** Real data: for Movies the rating column is a TMDb score; Q2's winner is `'0.0'` (899 rows). TV-MA wins only for the 6 sample TV rows. |
+| "31 unit, regression, and API tests" / "Pytest Passing" | README | ✅ | `pytest -q` = 31 passed (12 ETL + 11 SQL + 8 API; was 23 before the fixes). Passing is on the 20-row sample, not the 16k DB. The badge is static (no CI). |
+| "Pinned application & testing dependencies" (original README) | README structure | ✅ **Fixed in README** | `requirements.txt` uses `>=` minimums only, no exact pins or lockfile. README now says "minimum versions, not pinned". |
+| "Multi-stage Docker build with health checks" | README | ✅ | `Dockerfile` has builder + final stage and a `HEALTHCHECK` hitting `/health`. **Not run in this review**, so the container itself is untested here. |
+| "If online, it fetches the latest catalog update. If offline, falls back to sample_netflix.csv" (original README) | README Quick Start | ✅ **Code and README fixed** (was ❌) | First build: local files were checked first and the repo-root sample won, so Kaggle was never tried. Now: `--sample`/`$NETFLIX_CSV`, then a full local CSV, then the Kaggle download, and the sample only if the download is unavailable. README documents exactly this order. Tested with a stubbed `kagglehub`; a real download was **not** run. |
+| "Resolves schema drift... sub-15ms response latencies" / "sub-10ms" (original README resume bullet) | README resume bullet (and earlier review) | ✅ **Removed from README** (was ❌ unmeasured) | No benchmark or timing code exists in the repo. Still do not cite any latency number. |
+| "Automated validation" (resume bullet, original README) | README | ✅ **Reworded in README** (was ⚠️) | README now says "cleaning and coercion in the ETL". Validation is cleaning/coercion plus Pydantic response models; there is no input-schema validation of the CSV. |
+| "Sample never mixes into the real DB" | README Quick Start (new) | ✅ for new loads, ❌ for the current file | Tested (`test_main_*`). The local `netflix.db` predates the fix, still has 16,020 rows and the two old column-shifted rows `s2`/`s5`; README says so. |
+| Old README file-name errors (`setup_database.py`, `netflix_analysis.sql`) | previous README | ✅ **Fixed** | README now references `setup.py` and `netflix.sql`, which exist. |
 
-> [!CAUTION]
-> **Summary Assessment for Interviews:**  
-> The project exhibits a severe **data and documentation drift**. The SQL queries and README findings were written for the classic 8,807-title Kaggle dataset by Shivam Bansal, but the setup script downloads a completely different 16,000-title TMDb movie scrape (`bhargavchirumamilla/...`). If an interviewer asks you to run the SQL queries live on the provided database, half the queries will return empty sets or fail. You must address this proactively!
+> [!NOTE]
+> **Summary for interviews:** The earlier "severe drift" (table-name mismatch, `cast` vs `casts`, PostgreSQL syntax in the runnable path, ISO-date breakage, B4 exact-match bug, missing files) is **fixed in the code**, and so are the four problems from the first review (source order, shifted sample rows, sample/real mixing in the ETL, README claims). What remains is **data-shape drift**: the real 16,000 rows have no genres/duration (those columns are empty for them), their `rating` is a TMDb score, and my local `netflix.db` is still the old mixed load with 20 sample rows, so Q5, Q8, Q9, Q11, and B3 return results only from the sample rows until it is rebuilt from the Kaggle download. Say this proactively and you look rigorous rather than caught out.
 
 ---
 
@@ -230,493 +406,192 @@ An audit of every quantitative claim made in [README.md](file:///d:/Desktop/PROJ
 ### 15 Likely Technical Interview Questions & Concise Model Answers
 
 #### Q1: "Walk me through how `setup.py` ingests data into SQLite."
-> **Model Answer:** `setup.py` uses `kagglehub` to download a CSV dataset from Kaggle, establishes a connection to `netflix.db`, and executes DDL to create `netflix_titles`. It streams the CSV using Python's `csv.DictReader`, parses `release_year` into an integer, constructs an in-memory list of tuples, and uses `c.executemany` with `INSERT OR IGNORE` for batch insertion within a single database transaction.
+> **Model Answer:** `resolve_csv_source()` honours `--sample` / `$NETFLIX_CSV`, then a full local CSV, then calls `kagglehub.dataset_download`, and falls back to the bundled sample only if the download fails. `init_database()` creates `netflix_titles` (12 columns, `show_id` primary key), three indexes (type, release_year, country) and the `netflix` view. `load_data()` streams the CSV with `csv.DictReader`, cleans each field (`clean_text`, `parse_release_year`, `clean_date_added` to ISO), buffers tuples, and runs one `executemany` with `INSERT OR REPLACE` after clearing the table (`reset=True`), so the DB equals the chosen CSV and re-runs are idempotent. The sample is written to `netflix_sample.db`, never `netflix.db`. `main()` logs, verifies `COUNT(*)`, and exits 1 on error.
 
-#### Q2: "In `netflix.sql`, how do you find the most common rating for each content type?"
-> **Model Answer:** In Q2 ([netflix.sql:L55-68](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L55-L68)), I use the `RANK()` window function. Inside an inline derived table, I group by `type` and `rating`, count the rows, and compute `RANK() OVER (PARTITION BY type ORDER BY COUNT(*) DESC) AS ranking`. The outer query filters `WHERE ranking = 1` to extract the top-ranked mode rating per category while properly handling ties.
+#### Q2: "How do you find the most common rating per content type?"
+> **Model Answer:** Q2 (`netflix.sql:L69-86`) and the `/dominant-ratings` endpoint (`api.py:L112-136`) group by `type, rating` and compute `RANK() OVER (PARTITION BY type ORDER BY COUNT(*) DESC)` in a derived table, then filter `ranking = 1`. `RANK()` returns all ties. The API version also excludes empty ratings. On the live DB, Movie returns `'0.0'` because the movie rating column is a TMDb score, which shows why you must inspect real data.
 
-#### Q3: "What is the difference between `RANK()`, `DENSE_RANK()`, and `ROW_NUMBER()`?"
-> **Model Answer:** If two ratings have identical counts (a tie), `ROW_NUMBER()` arbitrarily assigns sequential numbers (1, 2) without acknowledging the tie. `RANK()` gives both the same rank (1, 1) and skips the next rank (yielding 1, 1, 3). `DENSE_RANK()` gives both rank 1 without skipping the next rank (yielding 1, 1, 2). For Q2, `RANK()` ensures that if two ratings tie for first place, both are returned.
+#### Q3: "`RANK()` vs `DENSE_RANK()` vs `ROW_NUMBER()`?"
+> **Model Answer:** For counts 10, 10, 8: `ROW_NUMBER` gives 1, 2, 3 (arbitrary tie-break), `RANK` gives 1, 1, 3, `DENSE_RANK` gives 1, 1, 2. Q2 uses `RANK` so tied top ratings both appear.
 
-#### Q4: "How does the SQLite query split comma-separated countries in Q4?"
-> **Model Answer:** SQLite lacks PostgreSQL's native `STRING_TO_ARRAY` and `UNNEST`. In Q4 ([netflix.sql:L94-103](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L94-L103)), I convert the comma-delimited string into a valid JSON array string using string concatenation (`'["' || REPLACE(country, ', ', '","') || '"]'`). I then cross-join against the SQLite table-valued function `json_each(...)`, which expands each JSON array element into a distinct row.
+#### Q4: "How does Q4 split comma-separated countries in SQLite?"
+> **Model Answer:** SQLite has no `UNNEST`/`STRING_TO_ARRAY`, so Q4 (`netflix.sql:L113-120`) builds a JSON array string with `'["' || REPLACE(country, ', ', '","') || '"]'` and cross-joins it with the table-valued function `json_each`, which emits one row per element (`value`). The PostgreSQL version is kept as a comment (L102-109). The same trick backs Q9, Q14, and `/top-countries`.
 
-#### Q5: "What are the limitations or risks of that `json_each` string replacement trick?"
-> **Model Answer:** It is fragile because it assumes clean input. If a country or actor string contains unescaped double quotes, backslashes, or internal commas that aren't delimiters, the resulting string is invalid JSON and SQLite raises a runtime parse error (`JSON error: syntax error`). In a production system, this data should be normalized into bridge tables during ETL.
+#### Q5: "What are the risks of the `json_each` trick?"
+> **Model Answer:** It assumes clean input. A value containing a double quote or backslash produces invalid JSON and SQLite raises a JSON error. It also assumes the delimiter is exactly `', '`. The robust fix is to normalize into bridge tables (`title_countries`, `title_cast`, `title_genres`) during ETL.
 
-#### Q6: "Why did you use `INSERT OR IGNORE` in `setup.py`?"
-> **Model Answer:** In [setup.py:L71](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L71), `show_id` is defined as `PRIMARY KEY`. `INSERT OR IGNORE` ensures idempotency: if the script is re-run or duplicate `show_id` values exist in the source CSV, SQLite quietly ignores duplicate key collisions rather than aborting the entire batch transaction.
+#### Q6: "Why `INSERT OR REPLACE` in `setup.py`?"
+> **Model Answer:** `setup.py:L238` writes with `INSERT OR REPLACE`, so a duplicate `show_id` within one load replaces the earlier row instead of failing. In the first build that was the only mechanism, so rows missing from a new CSV were never removed, which is exactly why the 20 sample rows ended up coexisting with the 16,000 Kaggle rows in my local `netflix.db`. Now `main()` also passes `reset=True`, which deletes the table contents in the same transaction before inserting, so the DB equals the CSV (and an empty CSV never wipes it). The trade-off is no incremental updates; `ON CONFLICT DO UPDATE` would be the alternative.
 
-#### Q7: "How is runtime extracted and filtered in Q5 and B3?"
-> **Model Answer:** In Q5 ([netflix.sql:L109-117](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L109-L117)), durations are stored as text (e.g. `'90 min'`). I filter `WHERE duration LIKE '%min%'`, strip `' min'` with `REPLACE(duration, ' min', '')`, and cast the remaining substring to an integer using `CAST(... AS INTEGER)` so that numerical sorting (`ORDER BY runtime_min DESC`) works correctly instead of alphabetical sorting.
+#### Q7: "How is runtime handled in Q5 and B3?"
+> **Model Answer:** `duration` is text like `'90 min'`. Q5 and B3 strip `' min'` with `REPLACE` and `CAST(... AS INTEGER)` so sorting and bucketing are numeric. B3 buckets with a `CASE`. **Caveat:** in the live DB only the 20 sample rows have a duration (Q5 returns "Om Shanti Om", 169 min; B3 returns 13 movies), because the 16,000 Kaggle rows have empty `duration`.
 
-#### Q8: "What does Q10 calculate, and what is the purpose of the scalar subquery?"
-> **Model Answer:** Q10 ([netflix.sql:L181-195](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L181-L195)) analyzes Indian release trends. The scalar subquery `(SELECT COUNT(show_id) FROM netflix WHERE country = 'India')` computes the total number of Indian titles across all time. The query divides each year's Indian release count by this total to compute the percentage contribution of each individual year.
+#### Q8: "What does Q10 compute, and what are its quirks?"
+> **Model Answer:** Q10 (`netflix.sql:L198-216`) counts India-related titles per release year and divides by a scalar subquery of all India titles (`country='India' OR country LIKE '%India%'` = 534 rows), as a percentage. Live top results: 2025 (63, 11.8%), 2024 (38, 7.12%), 2012 (34, 6.37%). **Quirk:** it groups by `country` too, so co-productions like "Austria, India" form separate groups and the exact `'India'` rows understate each year's share.
 
-#### Q9: "Why does Q12 check both `director IS NULL` and `TRIM(director) = ''`?"
-> **Model Answer:** In CSV ingestion, empty fields can either be loaded as SQL `NULL` or as empty text strings (`''`), depending on how the parser maps missing values. Checking `director IS NULL OR TRIM(director) = ''` guarantees that both true SQL nulls and whitespace-padded empty strings are captured.
+#### Q9: "Why check both `director IS NULL` and `TRIM(director) = ''`?"
+> **Model Answer:** The ETL's `clean_text` stores missing values as `''`, but other loads could leave `NULL`. Q12 handles both. The live DB has 137 such rows (0.9%).
 
-#### Q10: "In Q15, how does the classification logic work?"
-> **Model Answer:** Q15 ([netflix.sql:L250-278](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L250-L278)) uses conditional evaluation via `CASE WHEN description LIKE '%kill%' OR description LIKE '%violence%' THEN 'Bad' ELSE 'Good' END`. An inner query applies this label, and an outer query groups by `category` and counts titles to produce an aggregated metric of flagged titles.
+#### Q10: "How does Q15's classification work and where does it fail?"
+> **Model Answer:** `CASE WHEN description LIKE '%kill%' OR description LIKE '%violence%' THEN 'Bad' ELSE 'Good'` (L267+). The API's `content_label` and `classification` filter reuse the same logic with `Flagged`/`Standard`. Result: 1,144 of 16,020 (7.1%). It's substring matching with false positives ("skill" matches `%kill%`), so it's a demo heuristic, not moderation.
 
-#### Q11: "What indexing strategy would you recommend for this database?"
-> **Model Answer:** Currently, only `show_id` has an index (via the PRIMARY KEY constraint). In production, I would add B-Tree indexes on `release_year`, `type`, and `country` to optimize `WHERE` filtering and `GROUP BY` aggregations. For text searches like `description LIKE '%kill%'`, standard B-Trees cannot be used for leading wildcards, so I would implement SQLite FTS5 (Full-Text Search) virtual tables.
+#### Q11: "What indexing strategy is used, and what would you add?"
+> **Model Answer:** `setup.py:L160-162` creates B-tree indexes on `type`, `release_year`, `country`, plus the automatic PK index. Leading-wildcard `LIKE '%x%'` (director, cast, description, `country LIKE '%India%'`) cannot use them, and queries on the view still scan. I'd add FTS5 for text search, or normalized bridge tables with indexed keys.
 
-#### Q12: "How would you migrate this SQLite schema to PostgreSQL?"
-> **Model Answer:** In PostgreSQL, I would replace the `VARCHAR` limits with `TEXT`, change `json_each` to native array types (`TEXT[]`) using `STRING_TO_ARRAY`, and use PostgreSQL's native `UNNEST` function. I would also create an explicit ENUM type for `type` (`'Movie'`, `'TV Show'`) and store `date_added` as a `DATE` type rather than `VARCHAR`.
+#### Q12: "How would you migrate this to PostgreSQL?"
+> **Model Answer:** Use `TEXT[]` or bridge tables with `UNNEST(STRING_TO_ARRAY(...))` (already sketched in the comments of Q4/Q9), `DATE` for `date_added`, `INTEGER` for runtime, and replace `STRFTIME` with `EXTRACT`. The SQLite file would be loaded with `COPY`.
 
-#### Q13: "What happens if `setup.py` processes a 10 GB file instead of an 8 MB file?"
-> **Model Answer:** In [setup.py:L52-68](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L52-L68), the script loads all rows into a Python list in memory before calling `executemany`. On a 10 GB file, this would exhaust available RAM and trigger an `OutOfMemory` crash. To fix this, I would stream the generator or process in batches of 5,000–10,000 records using a chunked iterator.
+#### Q13: "What happens with a 10 GB CSV?"
+> **Model Answer:** `load_data` builds the full `rows_to_insert` list in memory before `executemany` (`setup.py:L187-245`), so a 10 GB file would exhaust RAM. I'd batch in chunks of 5-10k rows (`executemany` per chunk, commit per chunk) or use a generator.
 
-#### Q14: "Why does Bonus Query B4 misclassify US content in the current database?"
-> **Model Answer:** B4 ([netflix.sql:L323](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L323)) checks `WHEN country = 'United States' THEN 'US Content'`. In the Kaggle dataset ingested by `setup.py`, the United States is labeled as `'United States of America'`. Because of this exact string mismatch, B4 classifies all 5,421 US titles as `'International'`. This highlights why categorical values must be cleaned and normalized during the ingestion phase.
+#### Q14: "How do you protect the API from SQL injection?"
+> **Model Answer:** `list_titles` (`api.py:L204+`) collects conditions into a list and passes values as named parameters (`:country`, `:actor`, ...) with `%` wildcards added in Python. Only fixed SQL fragments are concatenated into the `WHERE`. `limit` is bounded `1-100` via `Query(ge, le)`, and `release_year` is typed `int`.
 
-#### Q15: "Why are date queries Q6, B1, and B5 fragile?"
-> **Model Answer:** Q6 and B1 assume `date_added` is formatted as `"Month DD, YYYY"` and extract the last 4 characters using `SUBSTR(..., -4)`. If the date is in ISO 8601 format (`YYYY-MM-DD`), the last 4 characters represent `"-MM-DD"` (e.g. `"-05-16"`), casting to an integer of `5` or `0`, which breaks the `>= current_year - 5` comparison. B5 also assumes a space delimiter exists before the month name, which fails on ISO dates. Dates should always be parsed into standardized ISO dates during ETL.
+#### Q15: "How do you test this, and what do the tests not cover?"
+> **Model Answer:** 31 pytest tests. `conftest.py` builds a temp SQLite DB from `sample_netflix.csv` using the real `init_database` and `load_data`, and overrides `get_db` for the `TestClient`. Tests cover cleaners and schema (4), sample-file integrity (1), CSV source precedence with a stubbed `kagglehub` (4), reset and sample-vs-real-DB separation (3), Q1-Q8/Q10/Q15/bonus SQL (11), and all API endpoints (8). Gaps: no tests for Q9, Q11-Q14 individually, no data-volume or real-dataset checks, no real Kaggle download test, no Docker test, and no CI.
 
 ---
 
 ### 5 Hard Follow-up Questions & What a Strong Answer Must Include
 
-#### Hard Follow-up 1: "I notice that if I run `setup.py` and then open `netflix.sql`, every query fails immediately with `no such table: netflix`. Why?"
-- **What a strong answer must include:**  
-  1. *Immediate ownership & honesty:* Acknowledge the exact bug: [setup.py:L34](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L34) creates table `netflix_titles`, while [netflix.sql:L47](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql#L47) queries table `netflix`.
-  2. *Secondary column bug:* Note that [setup.py](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py) creates column `cast`, whereas [netflix.sql](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql) expects `casts`.
-  3. *SQL Keyword collision:* Explain that `cast` is an ANSI SQL reserved keyword (`CAST(x AS type)`), so in SQLite, referencing `cast` without quotes causes syntax errors.
-  4. *Immediate fix:* Either standardize the DDL to `CREATE TABLE netflix` with column `cast_members`, or create a view:  
-     `CREATE VIEW netflix AS SELECT show_id, type, title, director, "cast" AS casts, country, date_added, release_year, rating, duration, listed_in, description FROM netflix_titles;`.
+#### Hard Follow-up 1: "I ran `python setup.py` with internet on your first version and it loaded 20 rows. Why?"
+- **Strong answer:**
+  1. Own it: in the first build `resolve_csv_source` checked the CWD for candidate files first, and `sample_netflix.csv` was in the repo root, so Kaggle was never contacted. The README claimed the opposite.
+  2. Fix (now in `setup.py:L58-101`): `--sample` / `$NETFLIX_CSV` override, then a full local CSV, then the Kaggle download, and the sample only when the download is unavailable, with a warning. README rewritten to match; four tests cover the order.
+  3. Be honest about the limit: tested with a stubbed `kagglehub`, not a real download.
 
-#### Hard Follow-up 2: "If you run `netflix.sql` from top to bottom in SQLite, it crashes on Line 85. What is happening?"
-- **What a strong answer must include:**  
-  1. *Root Cause:* Line 85 contains un-commented PostgreSQL code: `SELECT TRIM(UNNEST(STRING_TO_ARRAY(country, ',')))...`. SQLite does not implement `STRING_TO_ARRAY` or `UNNEST`.
-  2. *Architectural principle:* A SQL migration script should never mix incompatible dialect syntaxes in the same runnable file.
-  3. *Resolution:* Separate queries into dialect-specific directories (`sql/sqlite/` and `sql/postgres/`), or comment out alternative dialect snippets cleanly.
+#### Hard Follow-up 2: "Your DB has 16,020 rows but README said 16,000 movies. And Q9/Q5 results look tiny. Explain."
+- **Strong answer:**
+  1. `netflix.db` = 16,000 Kaggle rows + 20 sample rows (the first ETL upserted both; ids `s1`-`s20`).
+  2. The Kaggle rows have empty `listed_in`/`duration` and a TMDb-score `rating`; only sample rows populate genres/durations, so Q9 returns 18 genre rows (Dramas 8, Comedies 7...), including junk like `TV-MA` where a column-shifted sample row leaked.
+  3. Fixed: real loads now reset the table and the sample goes to `netflix_sample.db`; README counts corrected. Not done: the existing file was not rebuilt, because that needs the Kaggle download. Rebuild with `python setup.py` once Kaggle access is available.
 
-#### Hard Follow-up 3: "How would you normalize this schema into Third Normal Form (3NF), and what would the ERD look like?"
-- **What a strong answer must include:**  
-  1. *Identify 1NF violations:* Non-atomic values in `director`, `cast`, `country`, and `listed_in`.
-  2. *Proposed Tables:*  
-     - `titles` (`title_id`, `type_id`, `title`, `date_added`, `release_year`, `rating_id`, `duration_minutes`, `description`)
-     - `people` (`person_id`, `full_name`)
-     - `title_directors` (`title_id`, `person_id`) [Junction table]
-     - `title_cast` (`title_id`, `person_id`, `role_name`) [Junction table]
-     - `genres` (`genre_id`, `genre_name`)
-     - `title_genres` (`title_id`, `genre_id`) [Junction table]
-     - `countries` (`country_id`, `country_name`)
-     - `title_countries` (`title_id`, `country_id`) [Junction table]
-  3. *Trade-off analysis:* Normalization eliminates duplicate strings, prevents update anomalies, and makes genre/actor filtering instantaneous with simple `JOIN`s, at the cost of slightly more complex ETL ingestion.
+#### Hard Follow-up 3: "Two sample rows had a name in `date_added`. How?"
+- **Strong answer:**
+  1. In the first `sample_netflix.csv`, rows `s2` and `s5` had unquoted comma-separated cast lists, which shifted columns (`date_added` became `'Gail Mabalane'` / `'Ranjan Raj'`). `csv.DictReader` can't recover.
+  2. `clean_date_added` returns unparseable input unchanged, so B1 got junk year buckets such as `lane` (`SUBSTR(...,-4)` of that string).
+  3. Fixed the CSV (quoted the fields) and added `test_sample_csv_rows_all_parse`. Not fixed: the ETL still passes unparseable dates through instead of rejecting or quarantining them, and the old local `netflix.db` still contains the two shifted rows.
 
-#### Hard Follow-up 4: "Your keyword search in Q15 classifies anything with 'kill' or 'violence' as 'Bad'. What are the false-positive failure modes, and how would you build a production moderation classifier?"
-- **What a strong answer must include:**  
-  1. *Failure Modes:* Substring matching on `'kill'` flags benign words like "skill", "skilled", "overkill", or comedy titles like "To Kill a Mockingbird" or "Kill Bill" (which may be critically acclaimed, not inherently 'bad').
-  2. *No semantic context:* "A detective stops a killer" vs. "Senseless violence".
-  3. *Production Alternative:*  
-     - Use tokenized word boundaries (`\bkill\b` via Regex or FTS5) instead of naive substrings.
-     - Leverage modern NLP / LLM classification (e.g., fine-tuned BERT or zero-shot LLM with structured Pydantic output) using established content rating guidelines (MPAA/TV-PG content descriptors like `violence: none | mild | graphic`).
+#### Hard Follow-up 4: "How would you normalize this schema to 3NF?"
+- **Strong answer:**
+  1. 1NF violations: `director`, `cast`, `country`, `listed_in`.
+  2. Tables: `titles`, `people`, `title_directors`, `title_cast`, `genres`, `title_genres`, `countries`, `title_countries` (junction tables).
+  3. Benefit: no string-split hacks, exact country matches (no `LIKE '%India%'`), indexed joins. Cost: more complex ETL.
 
-#### Hard Follow-up 5: "How would you design an automated CI/CD evaluation pipeline to guarantee that changes to `setup.py` don't break `netflix.sql`?"
-- **What a strong answer must include:**  
-  1. *Golden Dataset:* Create a small, deterministic fixture dataset (`fixtures/sample_titles.csv`, ~50 rows) with known edge cases (null directors, multi-country strings, single quotes, ISO dates).
-  2. *Schema Contracts:* Use Pydantic or Great Expectations to validate raw CSV column names and data types before database load.
-  3. *Pytest Runner in GitHub Actions:* Write test assertions running each SQL query against an in-memory SQLite database populated with the fixture, asserting expected output rows and schemas.
-  4. *Dialect Linting:* Run SQLFluff in the CI workflow to catch dialect incompatibilities automatically.
+#### Hard Follow-up 5: "You claimed sub-15ms API latency. Show me."
+- **Strong answer:**
+  1. Be honest: no benchmark exists in the repo. It was an unmeasured README claim and I removed it. A real number needs `wrk`/`hey` or a timing middleware.
+  2. Reason about it: SQLite on a local file, small result sets, indexed filters; but `LIKE '%...%'` and `json_each` queries scan ~16k rows, so those endpoints would be slower than `/health`.
+  3. Note the API opens a new connection per request and runs `CREATE VIEW IF NOT EXISTS` each time (`db.py`).
 
 ---
 
 ### 2-Minute Spoken Explanation Script
 
-> *"Hi! I'd love to share the Netflix Catalog Analytics project I built, the challenges I tackled, and what it taught me about real-world data engineering.*
+> *"I built a Netflix catalog analytics project: a Python ETL, a 20-query SQL suite, and a small FastAPI service, with tests and Docker.*
 >
-> *The goal was to analyze content catalog dynamics—understanding the distribution between films and series, identifying top producing countries, and analyzing creative personnel trends. To do this, I built an ingestion pipeline in Python that connects to the Kaggle Hub API, downloads the catalog metadata, transforms and cleans fields like release years, and loads the data into a relational SQLite database.*
+> *The ETL, `setup.py`, prefers a full local CSV or the Kaggle download (via kagglehub), and uses the small bundled sample only when asked or when the download is unavailable. It cleans fields like dates and release years and does a full reload into SQLite, with the sample kept in a separate database file. It builds three indexes and a compatibility view, so the analyst SQL and the API both query a stable `netflix` view. The SQL covers 15 business questions and 5 bonus ones: `RANK() OVER` for dominant ratings, `json_each` to unnest comma-separated countries, genres and actors in SQLite, percentage trends with scalar subqueries, and a keyword-based content flag.*
 >
-> *On the analytical side, I wrote a suite of 20 SQL queries that tackle real business questions. For instance, rather than doing simple aggregations, I used window functions like `RANK() OVER (PARTITION BY type ORDER BY COUNT(*) DESC)` to determine the dominant maturity ratings, and implemented JSON table-valued functions using SQLite's `json_each` to unnest comma-delimited fields like genres and cast members into relational rows.*
+> *On top of that, I exposed eight FastAPI endpoints with Pydantic response models, pagination, and parameterized filters, and there are 31 pytest tests that run against a 20-row sample fixture. A multi-stage Dockerfile and compose file package the API.*
 >
-> *However, what made this project an incredible engineering lesson was diagnosing **data drift and schema mismatch**. When investigating the live database against the original Kaggle specifications, I discovered that the newly downloaded 2025 dataset had dropped television series, lacked duration strings, and formatted dates in ISO 8601 rather than standard text formats. The queries assumed the classic Shivam Bansal schema, which caused table-name and date-parsing discrepancies.*
->
-> *Diagnosing this taught me why data contracts and validation are essential in production pipelines. It showed me that you can't just assume upstream schemas remain static. To fix this, I designed a Pydantic schema validation layer, separated SQLite and PostgreSQL dialect scripts, and created an automated Pytest test suite that verifies query integrity against a known golden dataset.*
->
-> *I'm eager to bring this same technical rigor, SQL depth, and defensive engineering mindset to your data engineering team."*
+> *The most useful lesson was data drift. The code was originally written against the classic Netflix dataset, but the 2025 dataset I ingest is mostly movies with TMDb-style ratings and no genres or durations. So I made the ETL tolerant, added the view and ISO-date handling, and I can tell you exactly which queries produce meaningful results on the real rows and which only work on the sample rows. After a self-review I fixed four things: the source-selection order, two malformed fixture rows, sample rows mixing into the real database, and several README claims. If I extended it, I would rebuild the DB from the Kaggle download, normalize the multi-valued columns into bridge tables, add CI, and measure API latency rather than assume it."*
 
 ---
 
 ## 6. Weaknesses and Risks
 
-### Critical Bugs & Breaking Issues
+### Real, Current Issues
 
 ```
-[CRITICAL BUG #1] Table Name Discrepancy
-  Location: setup.py:L34 vs netflix.sql:L47
-  Details: setup.py creates table `netflix_titles`, but netflix.sql queries `FROM netflix`.
-  Impact: Every query in netflix.sql fails with `sqlite3.OperationalError: no such table: netflix`.
+[ISSUE #1] FIXED - Sample CSV shadowed the Kaggle download
+  Was: setup.py resolve_csv_source checked local files first; sample_netflix.csv ships in the
+       repo, so a plain `python setup.py` loaded 20 rows and never reached kagglehub.
+  Now: setup.py:L58-101. --sample / $NETFLIX_CSV override, full local CSV, Kaggle download,
+       sample only if the download is unavailable. README matches. Tests: test_resolve_*.
+  Residual: the real Kaggle download path is untested here (stubbed kagglehub only).
 
-[CRITICAL BUG #2] Column Name Discrepancy & Reserved Word Collision
-  Location: setup.py:L39 vs netflix.sql:L18, L223, L237
-  Details: setup.py names the actor column `cast`, while netflix.sql uses `casts`. 
-           In SQL, `cast` is a reserved ANSI keyword (`CAST(...)`). Referencing `cast` 
-           without quotes in SQLite causes syntax errors.
-  Impact: Queries Q13 and Q14 fail with `no such column: casts` or syntax error.
+[ISSUE #2] PARTLY FIXED - Database mixed real and fixture data
+  Was: netflix.db (16,020 rows) = 16,000 Kaggle + 20 sample rows (INSERT OR REPLACE, no reset).
+  Now: the ETL resets the table on every load and writes the sample to netflix_sample.db
+       (setup.py:L187-245, L250-282). Tests: test_load_data_reset_*, test_main_*.
+  NOT FIXED: the existing local netflix.db was not rebuilt (needs the Kaggle download, which
+       is not available locally and was not run). It still has 16,020 rows (16,014 Movie /
+       6 TV Show), so Q5, Q8, Q9, Q11, B3 still return only sample rows there. README says so.
 
-[CRITICAL BUG #3] Cross-Dialect Syntax Poisoning
-  Location: netflix.sql:L85-91
-  Details: PostgreSQL functions `UNNEST` and `STRING_TO_ARRAY` are included without comment markers.
-  Impact: Executing netflix.sql in SQLite halts on line 85 with `no such function: STRING_TO_ARRAY`.
+[ISSUE #3] Real-data columns are empty/semantically different  (OPEN, data issue)
+  Location: Kaggle rows in netflix.db
+  Details: listed_in and duration are '' for all 16,000; rating is a TMDb score ('0.0',
+           '6.0', ...), not a maturity rating; 466 rows have empty country.
+  Impact: Q2 returns '0.0' for Movies; genre/runtime analytics are not meaningful on real data.
 
-[CRITICAL BUG #4] File Naming Inconsistency in README
-  Location: README.md:L21-22 vs Repo Root
-  Details: README instructs users to run `python setup_database.py` and open `netflix_analysis.sql`.
-           The actual files in the repository are `setup.py` and `netflix.sql`.
-  Impact: Immediate `FileNotFoundError` for any recruiter or developer following the README.
+[ISSUE #4] FIXED (CSV) - Malformed sample CSV rows
+  Was: sample_netflix.csv rows s2, s5: unquoted cast list shifted columns; date_added =
+       'Gail Mabalane' / 'Ranjan Raj'; B1 returned junk year buckets (e.g. 'lane').
+  Now: cast fields quoted; all 20 rows have 12 columns and an ISO-parseable date.
+       Test: test_sample_csv_rows_all_parse.
+  Residual: clean_date_added still passes unparseable dates through; the un-rebuilt local
+       netflix.db still contains the two old shifted rows.
 
-[CRITICAL BUG #5] Data Drift: Empty Duration and Genre Fields
-  Location: netflix.db (table netflix_titles)
-  Details: In the ingested 2025 dataset, `duration` and `listed_in` are 100% empty strings.
-  Impact: Queries Q5, Q8, Q9, Q11, and B3 return 0 rows or blank categories.
-
-[CRITICAL BUG #6] Date Format Parsing Breakdown
-  Location: netflix.sql:L126, L286, L335
-  Details: Date queries assume `"Month DD, YYYY"`. The database stores ISO `"YYYY-MM-DD"`.
-  Impact: Q6 returns 0 rows; B1 returns day-month snippets instead of years; B5 returns empty strings.
+[ISSUE #5] Q10 grouping skews percentages  (OPEN)
+  Location: netflix.sql:L198-216, api.py:L172+
+  Details: GROUP BY country, release_year splits co-productions ("Austria, India") from
+           exact 'India' rows, while the denominator counts all 534 India-related rows.
+  Impact: per-year percentages are understated and fragmented across groups.
 ```
 
 ### Fragile Code & Missing Validation
-- **JSON Unnesting Hack:** `json_each('["' || REPLACE(country, ', ', '","') || '"]')` fails if values contain double quotes or backslashes.
-- **In-Memory Tuple List:** `rows = [...]` in [setup.py:L52-68](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L52-L68) accumulates the entire dataset into memory before insertion.
-- **Unpinned External Dependency:** [setup.py:L15](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/setup.py#L15) imports `kagglehub`, but there is no `requirements.txt` specifying the package version.
+- **JSON unnesting hack:** `json_each('["' || REPLACE(country, ', ', '","') || '"]')` breaks on quotes/backslashes in values (used in Q4, Q9, Q14, `/top-countries`).
+- **In-memory row buffer:** `rows_to_insert` in `load_data` loads the whole CSV before inserting.
+- **Silent data pass-through:** unparseable dates are stored as-is; `type` defaults to `'Movie'` and `title` to `'Untitled'` when missing, which can hide bad input.
+- **Duplicated view DDL:** the `netflix` view is defined in `setup.py`, `netflix.sql`, and `src/db.py` (the API re-runs `CREATE VIEW IF NOT EXISTS` on every request connection).
+- **Dependencies:** `>=` minimums only; unused `pydantic-settings` and `python-dotenv` listed.
+- **Test coverage gaps:** tests use the 20-row sample; Q9, Q11-Q14 have no dedicated SQL test; the Kaggle path is only stub-tested; no Docker/compose test; no CI.
+- **Destructive reload:** `main()` always resets the target table. That is intended (DB equals source), but a successful run with a bad full CSV replaces good data; there is no row-count sanity check on the new CSV.
 
 ### Security, Secrets & Repository Hygiene
-- **Committed 8 MB Binary File:** [netflix.db](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.db) is tracked directly in Git history without Git LFS. Relational database binaries should be excluded via `.gitignore` and generated reproducibly via ETL scripts.
-- **No Gitignore:** The repository lacks a `.gitignore` file, risking accidental commits of Python cache files (`__pycache__/`, `.pytest_cache/`) and local credentials (`kaggle.json`).
+- **Good:** `.gitignore` (excludes `*.db`, `.env`, caches) and `.dockerignore` exist; `netflix.db` is **not tracked** in git; the API uses bound parameters; no secrets are committed.
+- **CORS:** `allow_origins=["*"]` with `allow_credentials=True` (`api.py:L36-42`) is permissive; fine for a demo, not for production.
+- **No authentication or rate limiting** on the API.
+- **Docker:** `docker-compose.yml` still declares `version: '3.8'` (obsolete key, harmless); the container relies on a bind-mounted `netflix.db`, which is gitignored, so a fresh clone must run `python setup.py` (or `docker compose` will start with an empty/missing DB). `.dockerignore` does not exclude `*.db`, so `COPY . /app` bakes in a local DB if present. The container build was not executed during this review.
+- **Uncommitted changes:** the fixes from this pass (`setup.py`, `sample_netflix.csv`, `tests/test_etl.py`, `README.md`) are working-tree edits on top of commit `8502442`; nothing has been committed.
 
 ### Performance & Scalability Bottlenecks
-- **Leading Wildcard Queries:** `WHERE director LIKE '%Rajiv Chilaka%'` and `WHERE casts LIKE '%Salman Khan%'` force full table scans across all 16,000 rows because leading wildcards invalidate standard B-Tree index lookups.
-- **Computed Expressions in WHERE Clauses:** Queries like `WHERE CAST(SUBSTR(...) AS INTEGER) >= ...` compute functions on every row at runtime, preventing the SQLite query planner from utilizing index ranges.
+- **Leading-wildcard `LIKE`** (`director LIKE '%Rajiv Chilaka%'`, `casts LIKE ...`, description keyword flags, `country LIKE '%India%'`) forces full scans of ~16k rows.
+- **Computed expressions in `WHERE`** (Q6's `CASE`/`SUBSTR`/`CAST`) prevent index use on `date_added`.
+- **API `GET /titles`** runs two queries per call (count + page) and uses `LIKE` filters; fine at this scale, would not scale to millions of rows.
 
 ---
 
 ## 7. Suggested Improvements (Prioritized)
 
-### Prioritized Improvement Matrix
+Already implemented and therefore **removed from the backlog**: schema/view alignment, ISO-date handling, ETL cleaning functions and indexes, pytest suite, FastAPI layer with Pydantic models, Dockerfile + compose, requirements.txt, logging module, README modernization, `.gitignore`, sample CSV, and (this pass) Kaggle-first source resolution with `--sample` / `$NETFLIX_CSV`, sample/real DB separation with reset-on-load, repaired sample rows with a parse test, and corrected README claims.
 
 | Improvement | Why It Matters | Effort | Priority |
 | :--- | :--- | :---: | :---: |
-| **Fix Schema & Naming Discrepancies** | Resolves crashes: aligns table name, column names, and dialect syntax. | **S** | **HIGH** |
-| **Pydantic Validation & Ingestion Pipeline** | Enforces data types, date formatting, and cleans missing strings during ETL. | **M** | **HIGH** |
-| **Automated Testing Suite (Pytest + Golden Data)** | Proves queries work; prevents regression; demonstrates CI/CD competence. | **M** | **HIGH** |
-| **FastAPI REST Serving Layer** | Converts static SQL into an interactive, testable API with OpenAPI docs. | **M** | **HIGH** |
-| **README & Architecture Modernization** | Fixes reproduction commands, documents real numbers, provides Mermaid diagrams. | **S** | **HIGH** |
-| **Docker & Containerization** | Enables one-command reproduction (`docker compose up`) for hiring managers. | **S** | **MED** |
-| **Structured Logging & Latency Tracking** | Replaces `print()` with structured JSON logs and query execution timers. | **S** | **MED** |
-| **Full-Text Search (SQLite FTS5)** | Replaces slow `LIKE '%...%'` queries with sub-millisecond full-text indexing. | **M** | **MED** |
-| **Text-to-SQL / LLM Natural Language Querying** | Modern AI feature allowing non-technical users to query the catalog in English. | **L** | **LOW** |
+| **Rebuild `netflix.db` from the Kaggle download** (`python setup.py` with `kagglehub` and credentials) | Removes the 20 sample rows and the two old shifted rows from the local DB; makes the README counts (then 16,000) reproducible | **S** | **HIGH** |
+| **Quarantine rows with unparseable dates** (log and skip in `load_data`) | The ETL, not just the fixture, stops junk year buckets in B1 | **S** | **MED** |
+| **Add GitHub Actions CI** running `pytest` (and `docker build`) | Proves tests stay green; gives a badge that is real | **S** | **MED** |
+| **Fix Q10 grouping** (group by `release_year` only, or unnest countries) | Correct percentages | **S** | **MED** |
+| **Batch inserts + per-row validation/rejection log** in `load_data` | Handles large files; surfaces bad rows | **M** | **MED** |
+| **Normalize into bridge tables** (`title_countries`, `title_cast`, `title_genres`) | Removes the `json_each` hack and `LIKE '%x%'` matches | **M** | **MED** |
+| **Measure API latency** (timing middleware or `hey`/`wrk`) and add request logging | Replaces unmeasured claim with data | **S** | **MED** |
+| **Tests for Q9, Q11-Q14** and for Docker health | Closes coverage gaps | **S** | **LOW** |
+| **SQLite FTS5** for title/description search | Replaces `LIKE '%...%'` scans | **M** | **LOW** |
+| **Tighten CORS, add API key / rate limiting**; drop unused deps; remove obsolete compose `version` | Production hygiene | **S** | **LOW** |
+| **Text-to-SQL layer (optional)** | Natural-language querying; only worth it as a stretch feature | **L** | **LOW** |
 
----
-
-### Concrete Implementation Steps & Code Sketches for High-Priority Items
-
-#### 1. Schema & Ingestion Alignment (Fixing the Core Pipeline)
-**Implementation Steps:**
-1. Pin dependencies in a new `requirements.txt` (`kagglehub>=0.3.0`, `pydantic>=2.0.0`).
-2. Update the ETL script to clean and normalize columns during ingestion:
-   - Normalize country names (`"United States of America"` -> `"United States"`).
-   - Standardize `date_added` into ISO `YYYY-MM-DD`.
-   - Rename table consistently to `netflix_titles` and rename `cast` column to `cast_members`.
-3. Create a backward-compatible view `netflix` so legacy queries execute seamlessly.
-
-**Code Sketch (`src/etl.py`):**
+### Sketch: Batched Load
 ```python
-import sqlite3
-import csv
-from datetime import datetime
-
-def normalize_country(country_str: str) -> str:
-    if not country_str:
-        return ""
-    return country_str.replace("United States of America", "United States")
-
-def clean_date(date_str: str) -> str:
-    if not date_str:
-        return ""
-    date_str = date_str.strip()
-    # Handle 'Month DD, YYYY' or 'YYYY-MM-DD'
-    for fmt in ("%B %d, %Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-    return date_str
-
-def init_db(db_path: str = "netflix.db"):
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS netflix_titles (
-            show_id      TEXT PRIMARY KEY,
-            type         TEXT NOT NULL,
-            title        TEXT NOT NULL,
-            director     TEXT,
-            cast_members TEXT,
-            country      TEXT,
-            date_added   TEXT,
-            release_year INTEGER,
-            rating       TEXT,
-            duration     TEXT,
-            listed_in    TEXT,
-            description  TEXT
-        );
-    """)
-    # Compatibility view for SQL queries expecting `netflix` and `casts`
-    c.execute("""
-        CREATE VIEW IF NOT EXISTS netflix AS
-        SELECT show_id, type, title, director, cast_members AS casts,
-               country, date_added, release_year, rating, duration,
-               listed_in, description
-        FROM netflix_titles;
-    """)
-    conn.commit()
-    conn.close()
+BATCH = 5000
+batch = []
+for row in reader:
+    batch.append(to_tuple(row))
+    if len(batch) >= BATCH:
+        c.executemany(INSERT_SQL, batch); conn.commit(); batch.clear()
+if batch:
+    c.executemany(INSERT_SQL, batch); conn.commit()
 ```
 
 ---
 
-#### 2. Evaluation Setup (Golden Dataset & Pytest Suite)
-**Implementation Steps:**
-1. Create a deterministic fixture `tests/fixtures/golden_netflix.csv` containing 20 curated rows covering all edge cases (null directors, TV shows, movies, diverse dates, multi-country strings).
-2. Write unit tests using `pytest` that initialize an in-memory SQLite database (`:memory:`), run every query in `netflix.sql`, and assert expected output rows and schemas.
-
-**Code Sketch (`tests/test_queries.py`):**
-```python
-import sqlite3
-import pytest
-
-@pytest.fixture
-def test_db():
-    conn = sqlite3.connect(":memory:")
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE netflix (
-            show_id TEXT PRIMARY KEY,
-            type TEXT,
-            title TEXT,
-            director TEXT,
-            casts TEXT,
-            country TEXT,
-            date_added TEXT,
-            release_year INTEGER,
-            rating TEXT,
-            duration TEXT,
-            listed_in TEXT,
-            description TEXT
-        )
-    """)
-    # Insert golden test records
-    sample_data = [
-        ('s1', 'Movie', 'Sample Movie 1', 'Director A', 'Actor 1, Actor 2', 'India', '2020-01-01', 2020, 'TV-MA', '120 min', 'Dramas', 'A violent thriller with kill scenes.'),
-        ('s2', 'TV Show', 'Sample Show 1', None, 'Actor 3', 'United States', '2021-05-10', 2021, 'TV-14', '6 Seasons', 'Comedies', 'A peaceful comedy.'),
-        ('s3', 'Movie', 'Sample Movie 2', 'Rajiv Chilaka', 'Actor 1', 'India', '2022-08-15', 2022, 'TV-MA', '95 min', 'Documentaries', 'An inspiring journey.')
-    ]
-    c.executemany("INSERT INTO netflix VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", sample_data)
-    conn.commit()
-    yield conn
-    conn.close()
-
-def test_q1_movie_vs_tv_count(test_db):
-    cursor = test_db.cursor()
-    cursor.execute("SELECT type, COUNT(*) FROM netflix GROUP BY type ORDER BY type;")
-    results = dict(cursor.fetchall())
-    assert results['Movie'] == 2
-    assert results['TV Show'] == 1
-
-def test_q2_dominant_rating(test_db):
-    cursor = test_db.cursor()
-    query = """
-    SELECT type, rating FROM (
-        SELECT type, rating, RANK() OVER (PARTITION BY type ORDER BY COUNT(*) DESC) AS ranking
-        FROM netflix GROUP BY type, rating
-    ) WHERE ranking = 1;
-    """
-    cursor.execute(query)
-    rows = cursor.fetchall()
-    assert ('Movie', 'TV-MA') in rows
-    assert ('TV Show', 'TV-14') in rows
-
-def test_q15_content_moderation_classification(test_db):
-    cursor = test_db.cursor()
-    query = """
-    SELECT show_id, 
-           CASE WHEN description LIKE '%kill%' OR description LIKE '%violence%' THEN 'Bad' ELSE 'Good' END 
-    FROM netflix ORDER BY show_id;
-    """
-    cursor.execute(query)
-    labels = dict(cursor.fetchall())
-    assert labels['s1'] == 'Bad'
-    assert labels['s2'] == 'Good'
-```
-
----
-
-#### 3. FastAPI Serving Layer with Pydantic Request/Response Models
-**Implementation Steps:**
-1. Create a clean modular service layer with FastAPI and Pydantic.
-2. Expose analytical query endpoints (e.g., `/stats/content-split`, `/analytics/top-countries`, `/titles/search`).
-3. Add Swagger OpenAPI documentation with parameter validation, pagination, and response models.
-
-**Code Sketch (`src/api.py`):**
-```python
-from fastapi import FastAPI, Query, HTTPException, Depends
-from pydantic import BaseModel, Field
-from typing import List, Optional
-import sqlite3
-
-app = FastAPI(
-    title="Netflix Catalog Intelligence API",
-    description="REST API serving analytical queries and metadata from the Netflix SQL database.",
-    version="1.0.0"
-)
-
-DB_PATH = "netflix.db"
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-class ContentSplitItem(BaseModel):
-    content_type: str = Field(..., alias="type")
-    total_count: int
-
-class TitleSummary(BaseModel):
-    show_id: str
-    type: str
-    title: str
-    release_year: Optional[int]
-    rating: Optional[str]
-    country: Optional[str]
-    classification: str
-
-@app.get("/api/v1/stats/content-split", response_model=List[ContentSplitItem])
-def get_content_split(db: sqlite3.Connection = Depends(get_db)):
-    cursor = db.cursor()
-    cursor.execute("SELECT type, COUNT(*) AS total_count FROM netflix GROUP BY type;")
-    return [dict(row) for row in cursor.fetchall()]
-
-@app.get("/api/v1/titles", response_model=List[TitleSummary])
-def search_titles(
-    type: Optional[str] = Query(None, description="Filter by 'Movie' or 'TV Show'"),
-    country: Optional[str] = Query(None, description="Filter by country substring"),
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    db: sqlite3.Connection = Depends(get_db)
-):
-    query = """
-    SELECT show_id, type, title, release_year, rating, country,
-           CASE WHEN description LIKE '%kill%' OR description LIKE '%violence%' THEN 'Flagged' ELSE 'Standard' END AS classification
-    FROM netflix
-    WHERE (:type IS NULL OR type = :type)
-      AND (:country IS NULL OR country LIKE '%' || :country || '%')
-    LIMIT :limit OFFSET :offset;
-    """
-    cursor = db.cursor()
-    cursor.execute(query, {"type": type, "country": country, "limit": limit, "offset": offset})
-    return [dict(row) for row in cursor.fetchall()]
-```
-
----
-
-#### 4. Dockerization & Deployment Readiness
-**Implementation Steps:**
-1. Write a lightweight multi-stage `Dockerfile` based on `python:3.11-slim`.
-2. Include an entrypoint script that executes automated setup if `netflix.db` is missing, and starts the Uvicorn web server.
-3. Provide `docker-compose.yml` for single-command deployment.
-
-**Code Sketch (`Dockerfile`):**
-```dockerfile
-FROM python:3.11-slim as builder
-
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends gcc && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
-
-FROM python:3.11-slim
-
-WORKDIR /app
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
-
-COPY . /app
-
-EXPOSE 8000
-
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs').read()" || exit 1
-
-CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
----
-
-#### 5. Relevant Modern Pattern: SQLite Full-Text Search (FTS5) & Natural Language Catalog Querying
-Because this is a catalog analytics project, implementing complex multi-agent frameworks like LangGraph would be unnecessary overengineering. However, two modern patterns genuinely fit this domain:
-
-1. **SQLite FTS5 (Full-Text Search Engine):**  
-   Replaces slow `LIKE '%...%'` queries with a BM25-ranked full-text search index over movie titles and descriptions:
-   ```sql
-   CREATE VIRTUAL TABLE titles_fts USING fts5(title, description, content='netflix_titles', content_rowid='show_id');
-   INSERT INTO titles_fts(titles_fts) VALUES('rebuild');
-   
-   -- Sub-millisecond BM25 relevance query:
-   SELECT title, rank FROM titles_fts WHERE titles_fts MATCH 'alien OR spacecraft' ORDER BY rank LIMIT 10;
-   ```
-2. **Deterministic Text-to-SQL Interface with Pydantic Structured Outputs:**  
-   If extending this project with an LLM, use an agent with schema-linking to translate user questions into read-only SQL:
-   ```python
-   from pydantic import BaseModel, Field
-
-   class GeneratedSQL(BaseModel):
-       thought_process: str = Field(description="Reasoning on how tables and columns are selected")
-       sql_query: str = Field(description="Executable SQLite query adhering strictly to the verified schema")
-   ```
-
----
-
-## 8. Portfolio and Outreach Notes
-
-### 60–90 Second Loom Video Script (Step-by-Step Demo)
-
-| Timestamp | Visual on Screen | Spoken Narration |
-| :--- | :--- | :--- |
-| **0:00 – 0:15** | Split screen: VS Code terminal and SQLite query editor. | *"Hi, I'm Apurv. Today I'm showcasing my Netflix Catalog Data Pipeline and Analytical SQL project, which processes and analyzes 16,000 titles from the global catalog."* |
-| **0:15 – 0:35** | Show `setup.py` and the database schema in DB Browser / SQLite CLI. | *"I built an automated ingestion pipeline in Python that pulls raw metadata directly via Kaggle Hub, cleans and transforms fields like release years, and loads them into a relational SQLite database with idempotent primary key constraints."* |
-| **0:35 – 0:55** | Highlight Query Q2 (Window Function) and Q4 (JSON Unnesting). | *"Here in the SQL analytical layer, I tackled complex catalog questions. For example, in Query 2, I used window functions like `RANK() OVER (PARTITION BY type ORDER BY COUNT(*) DESC)` to determine dominant ratings, and in Query 4, I unnested comma-delimited country data using virtual JSON table joins."* |
-| **0:55 – 1:15** | Terminal running `pytest tests/test_queries.py` and passing test output. | *"To ensure data integrity, I implemented an automated evaluation suite with Pytest that runs every analytical query against a golden test fixture to catch schema and distribution drift before deployment."* |
-| **1:15 – 1:30** | Quick preview of FastAPI Swagger UI (`/docs`). | *"Finally, I wrapped this pipeline in a containerized FastAPI service with OpenAPI documentation and Pydantic validation. The entire codebase is Dockerized and ready to deploy."* |
-
----
-
-### 3 Bullet Points for a Startup CTO Cold Email
-
-- **Production-Oriented SQL & ETL:** *Built an end-to-end Python/SQLite data pipeline ingesting 16,000+ catalog titles, utilizing window functions (`RANK() OVER`), JSON virtual table unnesting, and conditional sentiment categorization.*
-- **Data Quality & Forensic Analysis:** *Identified and resolved severe upstream schema drift across Kaggle dataset versions (date format mismatch, missing duration strings) by designing automated validation contracts and a Pytest regression suite.*
-- **Production API & Containerization:** *Containerized the pipeline with Docker and exposed catalog intelligence metrics via a sub-10ms FastAPI serving layer with Pydantic request/response validation.*
-
----
-
-### Privacy, Credentials & Safe Public Repository Guidelines
-
-1. **What Must NOT Be Shared Publicly:**
-   - **Kaggle API Credentials:** Never commit `kaggle.json` or hardcode `KAGGLE_USERNAME` / `KAGGLE_KEY` in source code.
-   - **Local Absolute Paths:** Avoid hardcoded paths referencing your personal machine (e.g., `D:\Desktop\PROJECTS\...`). Always use relative paths or environment variables (`os.getenv("DATA_DIR", "./data")`).
-   - **Binary Database in Git:** Remove `netflix.db` from git history and add it to `.gitignore`. A repository should contain code, tests, and configurations, not generated database binaries.
-2. **How to Create a Safe, Turnkey Public Demo Repository:**
-   - Add a robust `.gitignore` ignoring `.env`, `*.db`, `__pycache__/`, and `.pytest_cache/`.
-   - Provide a 100-row sample CSV (`sample_netflix_titles.csv`) directly in a `data/` folder so recruiters can test the project in 5 seconds without needing a Kaggle account or downloading 50 MB files.
-   - Add a GitHub Actions workflow (`.github/workflows/ci.yml`) running `pytest` on every pull request to show hiring managers a green "build: passing" badge.
-
----
-
-*Report prepared and verified by Senior AI / Data Engineering Reviewer. File generated as [PROJECT_REVIEW.md](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/PROJECT_REVIEW.md).*
+*Report updated after fixes; re-verified against current code and `netflix.db` (16,020 rows, not rebuilt); `pytest -q`: 31 passed (was 23). File generated as [PROJECT_REVIEW.md](PROJECT_REVIEW.md).*

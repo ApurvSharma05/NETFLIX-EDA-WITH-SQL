@@ -27,7 +27,7 @@ This project answers **15 business-critical questions** and **5 advanced analyti
 flowchart TD
     subgraph S1["1. Data Sources"]
         Kaggle["Kaggle Hub API<br>(bhargavchirumamilla/...)"]
-        SampleCSV["sample_netflix.csv<br>(Local Fallback Fixture)"]
+        SampleCSV["sample_netflix.csv<br>(20-row fixture: --sample or offline fallback)"]
     end
 
     subgraph S2["2. ETL & Ingestion Layer (setup.py)"]
@@ -35,7 +35,7 @@ flowchart TD
     end
 
     subgraph S3["3. Relational Storage Layer (netflix.db)"]
-        TableTitles[("Table: netflix_titles<br>16,000 Records / Indexed")]
+        TableTitles[("Table: netflix_titles<br>Indexed (sample goes to netflix_sample.db)")]
         ViewNetflix[("View: netflix<br>Backward-Compatibility View")]
     end
 
@@ -60,10 +60,10 @@ flowchart TD
 
 ```text
 ├── netflix.sql              # 20 analytical queries (15 business + 5 bonus) + DDL
-├── setup.py                 # Production ETL script (Kaggle download, cleaning, indexing)
-├── netflix.db               # SQLite database with indexed tables and compatibility view
-├── sample_netflix.csv       # Curated 20-row sample fixture for instant offline testing
-├── requirements.txt         # Pinned application & testing dependencies
+├── setup.py                 # Production ETL script (source selection, Kaggle download, cleaning, indexing)
+├── netflix.db               # SQLite database with indexed tables and compatibility view (gitignored; see "Rebuilding netflix.db")
+├── sample_netflix.csv       # 20-row fixture for tests / offline demos (loaded only into netflix_sample.db)
+├── requirements.txt         # Application & testing dependencies (minimum versions, not pinned)
 ├── Dockerfile               # Multi-stage production container build
 ├── docker-compose.yml       # Single-command Docker deployment
 ├── .dockerignore            # Build ignore rules
@@ -77,7 +77,7 @@ flowchart TD
 └── tests/
     ├── __init__.py          # Test package initialization
     ├── conftest.py          # Pytest fixtures (in-memory SQLite & TestClient)
-    ├── test_etl.py          # Unit tests for text cleaning and schema initialization
+    ├── test_etl.py          # Unit tests for cleaning, schema, source selection, sample integrity and sample/real DB separation
     ├── test_sql_queries.py  # Regression tests verifying all SQL analytical queries
     └── test_api.py          # Functional tests verifying all FastAPI REST endpoints
 ```
@@ -99,7 +99,16 @@ Run the automated ETL pipeline:
 ```bash
 python setup.py
 ```
-*Note: If `kagglehub` is installed and online, it fetches the latest catalog update. If offline, it automatically falls back to `sample_netflix.csv` or any local catalog CSV.*
+**Which CSV is used (in order):**
+1. `python setup.py --sample` forces the bundled 20-row `sample_netflix.csv`; `NETFLIX_CSV=/path/to/file.csv` forces that exact file.
+2. Otherwise, a full catalog CSV already in the project folder (`netflix_movies_detailed_up_to_2025.csv` or `netflix_titles.csv`).
+3. Otherwise, the Kaggle dataset downloaded with `kagglehub` (needs `kagglehub` installed and Kaggle access).
+4. Only if that download is unavailable (not installed, offline, no credentials) does it fall back to the sample, with a warning.
+
+**The sample never mixes into the real database.** A real load replaces the contents of `netflix.db` with exactly the chosen CSV (full reload, not an upsert on top of old rows). Sample loads (`--sample` or the fallback) are written to `netflix_sample.db` instead, and leave `netflix.db` untouched. To query the sample DB through the API: `NETFLIX_DB_PATH=netflix_sample.db uvicorn src.api:app`.
+
+#### Rebuilding `netflix.db`
+The `netflix.db` currently in this working folder was built **before** this fix and is a mixed load: **16,020 rows = about 16,000 Kaggle rows + the 20 sample rows** (16,014 Movie / 6 TV Show). The Kaggle rows have empty `listed_in` and `duration`, so Q5, Q8, Q9, Q11 and B3 only return sample rows on that file. It cannot be cleaned up from the repo alone: rebuilding a pure Kaggle database needs the Kaggle download (or the full CSV placed in this folder), then `python setup.py`. Its sample rows `s2` and `s5` also still carry the old column-shifted dates (the CSV is fixed; the DB was not rebuilt). That step has not been run here.
 
 ### 3. Run Analytical SQL Queries
 Open [netflix.sql](file:///d:/Desktop/PROJECTS/NETFLIX%20EDA/netflix.sql) in [DB Browser for SQLite](https://sqlitebrowser.org/) or run directly via Python / SQLite CLI:
@@ -117,7 +126,7 @@ uvicorn src.api:app --reload --host 0.0.0.0 --port 8000
 - **Health Check:** `curl http://localhost:8000/health`
 
 ### 5. Run the Automated Test Suite
-Execute all 23 unit, regression, and API endpoint tests:
+Execute all 31 unit, regression, and API endpoint tests (they run on the 20-row sample, not the full dataset):
 ```bash
 pytest -v
 ```
@@ -163,12 +172,16 @@ docker compose up --build
 
 | Metric / Dimension | Finding | Notes |
 | :--- | :--- | :--- |
-| **Content Distribution** | Features dominate the current 2025 scrape | 16,000 movie titles ingested with 1,000 titles per year (2010–2025). |
+| **Content Distribution** | Features dominate the 2025 scrape | In the current local `netflix.db` (16,020 rows: ~16,000 Kaggle + 20 sample): 16,014 Movie / 6 TV Show, with 1,000 Kaggle titles per added-year 2010–2025. |
 | **Geographic Hubs** | United States leads international production | United States leads (5,421 titles), followed by Japan (845), UK (802), South Korea (789), and India. |
 | **Domestic vs International** | Balanced global content split | Approximately 50.0% of titles originate in the US, while 50.0% originate internationally. |
-| **Upload Seasonality** | Fall & Winter peak uploads | Q4 (October and September) exhibits the highest concentration of catalog releases. |
+| **Upload Seasonality** | Fall & Winter peak uploads | September and October have the highest concentration of catalog additions (October 1,774; September 1,717). |
 | **Prolific Creators** | High-volume directors | Tyler Perry (20 titles), Steven Soderbergh (15 titles), and Sean McNamara (15 titles) lead catalog representation. |
-| **Content Safety Flagging** | Keyword-based classification | ~7.1% of titles contain violent or crime-related trigger keywords in their synopsis descriptions. |
+| **Content Safety Flagging** | Keyword-based classification | ~7.1% of titles (1,144 of 16,020) contain the keywords "kill" or "violence" in their description (a keyword heuristic, not moderation). |
+
+---
+
+> Figures above come from the current local `netflix.db` (a mixed load, see "Rebuilding `netflix.db`"). Genre and runtime queries (Q5, Q8, Q9, Q11, B3) return only sample rows on that file because the Kaggle rows have no genre or duration.
 
 ---
 
@@ -189,6 +202,6 @@ docker compose up --build
 
 ## 📄 Resume Bullet Points
 
-> - **Netflix Catalog Data Pipeline & Analytics Engine:** Engineered an end-to-end Python/SQLite data pipeline processing 16,000+ catalog titles, utilizing window functions (`RANK() OVER`), virtual JSON table unnesting (`json_each`), and conditional sentiment classification.
-> - **Defensive ETL & Forensic Drift Diagnosis:** Diagnosed and resolved severe upstream schema drift across Kaggle dataset versions (ISO date formats, missing fields, column reserved keywords) by introducing automated validation, B-tree indexes, and a 23-test Pytest suite.
-> - **Production API Serving & Containerization:** Exposed analytical insights via a containerized FastAPI REST backend with Pydantic validation, OpenAPI documentation, and multi-stage Docker deployment achieving sub-15ms response latencies.
+> - **Netflix Catalog Data Pipeline & Analytics Engine:** Engineered an end-to-end Python/SQLite data pipeline processing 16,000+ catalog titles, utilizing window functions (`RANK() OVER`), virtual JSON table unnesting (`json_each`), and keyword-based content flagging.
+> - **Defensive ETL & Forensic Drift Diagnosis:** Diagnosed and resolved severe upstream schema drift across Kaggle dataset versions (ISO date formats, missing fields, column reserved keywords) by introducing cleaning and coercion in the ETL, B-tree indexes, and a 31-test Pytest suite.
+> - **Production API Serving & Containerization:** Exposed analytical insights via a containerized FastAPI REST backend with Pydantic validation, OpenAPI documentation, and a multi-stage Docker setup.
